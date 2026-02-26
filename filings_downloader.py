@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,12 +55,53 @@ class RateLimiter:
         self._lock = threading.Lock()
 
     def acquire(self):
+        sleep_for = 0.0
         with self._lock:
             now = time.monotonic()
             if now < self._next_t:
-                time.sleep(self._next_t - now)
-                now = time.monotonic()
+                sleep_for = self._next_t - now
+                now = self._next_t
             self._next_t = max(self._next_t + self.period, now)
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+
+def _known_existing_archive_paths(out_dir: Path, layout: str) -> set[str]:
+    """Scan output directory once and build a set of already-downloaded archive paths."""
+    if not out_dir.exists():
+        return set()
+
+    known = set()
+    if layout == "mirror":
+        for root, _, files in os.walk(out_dir):
+            root_path = Path(root)
+            for name in files:
+                rel = (root_path / name).relative_to(out_dir)
+                known.add(normalize_archive_path(rel.as_posix()))
+        return known
+
+    # layout == "year_cik_accession": out_dir / YEAR / CIK / ACCESSION / filename
+    for year_entry in os.scandir(out_dir):
+        if not year_entry.is_dir():
+            continue
+        for cik_entry in os.scandir(year_entry.path):
+            if not cik_entry.is_dir():
+                continue
+            for accession_entry in os.scandir(cik_entry.path):
+                if not accession_entry.is_dir():
+                    continue
+                for file_entry in os.scandir(accession_entry.path):
+                    if not file_entry.is_file():
+                        continue
+                    filename = file_entry.name
+                    known.add(f"edgar/data/{cik_entry.name}/{filename}")
+
+    return known
+
+
+def _chunked(items: list[str], size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
 
 # --- Path helpers ---
@@ -188,6 +230,7 @@ class DownloadConfig:
     layout: str = "year_cik_accession"  # or "mirror"
 
     max_items: int | None = None  # for quick testing
+    submit_chunk_size: int = 5000
 
 
 def load_index(config: DownloadConfig, df: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -220,11 +263,8 @@ def download_from_index(df: pd.DataFrame, config: DownloadConfig) -> dict:
     if config.max_items is not None:
         paths = paths[: config.max_items]
 
-    # pre-filter missing (fast)
-    jobs = []
-    for p in paths:
-        if not local_path_from_archive(p, out_dir=out_dir, layout=config.layout).exists():
-            jobs.append(p)
+    known_existing = _known_existing_archive_paths(out_dir=out_dir, layout=config.layout)
+    jobs = [p for p in paths if p not in known_existing]
 
     stats = {"ok": 0, "fail": 0, "skipped": len(paths) - len(jobs)}
     failures = defaultdict(list)
@@ -236,28 +276,31 @@ def download_from_index(df: pd.DataFrame, config: DownloadConfig) -> dict:
     limiter = RateLimiter(config.target_rps)
 
     with ThreadPoolExecutor(max_workers=config.max_workers) as ex:
-        futs = [
-            ex.submit(
-                download_one,
-                archive_path=p,
-                out_dir=out_dir,
-                limiter=limiter,
-                base_url=config.base_url,
-                user_agent=config.user_agent,
-                retries=config.retries,
-                timeout=config.timeout,
-                layout=config.layout,
-            )
-            for p in jobs
-        ]
+        with tqdm(total=len(jobs), desc="📥 Downloading Form 4 / 4A") as progress:
+            for chunk in _chunked(jobs, config.submit_chunk_size):
+                futs = [
+                    ex.submit(
+                        download_one,
+                        archive_path=p,
+                        out_dir=out_dir,
+                        limiter=limiter,
+                        base_url=config.base_url,
+                        user_agent=config.user_agent,
+                        retries=config.retries,
+                        timeout=config.timeout,
+                        layout=config.layout,
+                    )
+                    for p in chunk
+                ]
 
-        for fut in tqdm(as_completed(futs), total=len(futs), desc="📥 Downloading Form 4 / 4A"):
-            path, err = fut.result()
-            if err is None:
-                stats["ok"] += 1
-            else:
-                stats["fail"] += 1
-                failures[err].append(path)
+                for fut in as_completed(futs):
+                    path, err = fut.result()
+                    if err is None:
+                        stats["ok"] += 1
+                    else:
+                        stats["fail"] += 1
+                        failures[err].append(path)
+                    progress.update(1)
 
     # write failure log
     if failures:
