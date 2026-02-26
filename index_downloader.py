@@ -4,7 +4,6 @@ import aiohttp
 import aiofiles
 from bs4 import BeautifulSoup
 import pandas as pd
-from glob import glob
 from tqdm import tqdm
 import concurrent.futures
 from datetime import date
@@ -87,38 +86,47 @@ def parse_company_idx(file_path: str) -> list[tuple]:
         print(f"⚠️  Error reading {file_path}: {e}")
     return rows
 
-# --- Data Aggregation (Unchanged, already optimized) ---
-def aggregate_all_form4(idx_root: Path = DOWNLOAD_DIR) -> pd.DataFrame:
-    """Aggregates all Form 4 filings from local .idx files using a process pool."""
-    idx_files = list(idx_root.rglob("company.*.idx"))
+# --- Data Aggregation ---
+def aggregate_all_form4(
+    idx_root: Path = DOWNLOAD_DIR,
+    idx_files: list[Path] | None = None,
+) -> pd.DataFrame:
+    """Aggregates Form 4 filings from local .idx files using a process pool."""
+    if idx_files is None:
+        idx_files = list(idx_root.rglob("company.*.idx"))
+
     print(f"📁 Found {len(idx_files)} .idx files to process...")
 
     if not idx_files:
         return pd.DataFrame(columns=["Company", "Form", "CIK", "Date", "Path"])
 
-    all_rows = []
+    frame_chunks = []
     max_workers = os.cpu_count()
     print(f"🚀 Starting parallel parsing with {max_workers} processes...")
-    
+
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(parse_company_idx, str(file)) for file in idx_files]
-        
+
         progress_bar = tqdm(
             concurrent.futures.as_completed(futures),
             total=len(idx_files),
             desc="🔍 Processing .idx files"
         )
-        
+
         for future in progress_bar:
             try:
                 rows = future.result()
                 if rows:
-                    all_rows.extend(rows)
+                    frame_chunks.append(
+                        pd.DataFrame(rows, columns=["Company", "Form", "CIK", "Date", "Path"])
+                    )
             except Exception as e:
                 print(f"A parsing process failed: {e}")
 
-    print("✅ Finished processing. Converting to DataFrame...")
-    return pd.DataFrame(all_rows, columns=["Company", "Form", "CIK", "Date", "Path"])
+    print("✅ Finished processing. Concatenating DataFrames...")
+    if not frame_chunks:
+        return pd.DataFrame(columns=["Company", "Form", "CIK", "Date", "Path"])
+    return pd.concat(frame_chunks, ignore_index=True)
 
 # --- Main Orchestration Logic ---
 async def download_all_idx_async(
@@ -197,9 +205,29 @@ async def download_all_idx_async(
             print(f"❌ Failed: {failed_count} files.")
         print("------------------------\n")
 
-def build_form4_index() -> pd.DataFrame:
+def build_form4_index(update_mode: bool = False) -> pd.DataFrame:
     """Builds the final index from downloaded files and saves it."""
-    df = aggregate_all_form4(DOWNLOAD_DIR)
+    existing_df = pd.DataFrame(columns=["Company", "Form", "CIK", "Date", "Path"])
+
+    if update_mode and Path(MASTER_PKL).exists():
+        existing_df = pd.read_pickle(MASTER_PKL)
+
+    if update_mode:
+        current_year = str(date.today().year)
+        idx_root = DOWNLOAD_DIR / current_year
+        files_to_parse = list(idx_root.rglob("company.*.idx")) if idx_root.exists() else []
+        print(f"🔄 Update mode: parsing {len(files_to_parse)} .idx files from {current_year}.")
+    else:
+        files_to_parse = list(DOWNLOAD_DIR.rglob("company.*.idx"))
+
+    new_df = aggregate_all_form4(DOWNLOAD_DIR, idx_files=files_to_parse)
+
+    if update_mode and not existing_df.empty:
+        df = pd.concat([existing_df, new_df], ignore_index=True)
+        df = df.drop_duplicates(subset=["Path"], keep="last")
+    else:
+        df = new_df
+
     if not df.empty:
         df.to_csv(MASTER_CSV, index=False)
         df.to_pickle(MASTER_PKL)
