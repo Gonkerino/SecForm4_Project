@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insider-research"
+version = "0.1.0"
+description = "Reproducible SEC ownership filing discovery and research infrastructure"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["tzdata==2026.5; sys_platform == 'win32'"]
+
+[project.scripts]
+insider = "insider_research.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+insider_research = ["migrations/*.sql"]

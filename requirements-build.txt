@@ -1,0 +1,5 @@
+# Runtime uses the standard library plus pinned IANA timezone data on Windows.
+# Reproduce the build tools with:
+# python -m pip install -r requirements-build.txt
+setuptools==80.9.0
+wheel==0.45.1

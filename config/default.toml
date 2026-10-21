@@ -1,0 +1,7 @@
+# Contact identity must be provided through SEC_USER_AGENT for online discovery.
+# The data directory is independent of the source repository.
+data_root = "D:/Data/InsiderResearch"
+max_rps = 3.0
+timeout_seconds = 45.0
+max_attempts = 4
+max_index_bytes = 134217728
