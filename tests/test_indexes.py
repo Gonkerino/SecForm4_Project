@@ -45,6 +45,18 @@ class IndexTests(unittest.TestCase):
     def test_no_ownership_is_valid_when_other_forms_exist(self):
         self.assertEqual(parse_master_index(HEADER + record(form="10-K")).rows, [])
 
+    def test_blank_nonownership_name_does_not_reject_quarter(self):
+        row = b"1593547||485BPOS|2016-02-26|edgar/data/1593547/0001135428-16-001124.txt\n"
+        parsed = parse_master_index(HEADER + row + record())
+        self.assertEqual(parsed.total_rows, 2)
+        self.assertEqual(len(parsed.rows), 1)
+        self.assertEqual(parsed.min_date, "2016-02-26")
+        for invalid in (record(company=""), record(form="485BPOS", company="", cik="0"),
+                        record(form="485BPOS", company="", filed="2024-02-30"),
+                        row.replace(b"edgar/data/1593547/", b"../../")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                parse_master_index(HEADER + invalid)
+
     def test_partial_quarter_plan_has_one_source(self):
         result = plan_sources(date(2024, 2, 5), date(2024, 2, 6), "quarterly")
         self.assertEqual([s.period for s in result], ["2024Q1"])

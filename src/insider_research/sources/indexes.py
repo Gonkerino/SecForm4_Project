@@ -115,7 +115,11 @@ def parse_master_index(content: bytes) -> ParsedIndex:
             cik, rest = line.split("|", 1)
             company, form, filed, path = rest.rsplit("|", 3)
             cik, company, form, filed, path = (v.strip() for v in (cik, company, form, filed, path))
-            if not re.fullmatch(r"[0-9]{1,10}", cik) or int(cik) == 0 or not company or not form:
+            # Some SEC indexes omit names on non-ownership rows (2016Q1,
+            # 485BPOS). Count and validate those rows without requiring a name
+            # that we do not store; ownership associations still require one.
+            if (not re.fullmatch(r"[0-9]{1,10}", cik) or int(cik) == 0
+                    or not form or (form in FORMS and not company)):
                 raise ValueError("invalid CIK, company or form")
             if re.fullmatch(r"[0-9]{8}", filed):
                 filed = f"{filed[:4]}-{filed[4:6]}-{filed[6:]}"

@@ -84,13 +84,14 @@ class HttpClient:
         self.limiter = RateLimiter(cfg.max_rps)
         self.opener = urllib.request.build_opener(SecOnlyRedirect(self.limiter))
 
-    def get(self, url: str) -> Response:
+    def get(self, url: str, *, max_bytes: int | None = None) -> Response:
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme != "https" or parsed.hostname != "www.sec.gov":
             raise FetchError("Only HTTPS www.sec.gov source URLs are supported")
         request = urllib.request.Request(url, headers={"User-Agent": self.cfg.user_agent,
                                                       "Accept-Encoding": "identity"})
-        deadline = time.monotonic() + 180
+        max_bytes = self.cfg.max_index_bytes if max_bytes is None else max_bytes
+        deadline = time.monotonic() + (900 if max_bytes > self.cfg.max_index_bytes else 180)
         for attempt in range(self.cfg.max_attempts):
             if time.monotonic() >= deadline:
                 raise FetchError("Request elapsed-time budget exhausted; retry this incomplete run later")
@@ -106,13 +107,13 @@ class HttpClient:
                     while True:
                         if time.monotonic() >= deadline:
                             raise FetchError("Request elapsed-time budget exhausted while reading index")
-                        chunk = response.read(min(65536, self.cfg.max_index_bytes + 1 - byte_count))
+                        chunk = response.read(min(65536, max_bytes + 1 - byte_count))
                         if not chunk:
                             break
                         parts.append(chunk)
                         byte_count += len(chunk)
-                        if byte_count > self.cfg.max_index_bytes:
-                            raise FetchError("Index exceeds the configured byte limit")
+                        if byte_count > max_bytes:
+                            raise FetchError("Response exceeds the configured byte limit")
                     body = b"".join(parts)
                     declared = response.headers.get("Content-Length")
                     if declared is not None and int(declared) != len(body):

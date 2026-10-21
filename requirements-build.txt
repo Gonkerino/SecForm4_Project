@@ -1,4 +1,4 @@
-# Runtime uses the standard library plus pinned IANA timezone data on Windows.
+# Runtime dependencies (Psycopg, tqdm and Windows timezone data) are in pyproject.toml.
 # Reproduce the build tools with:
 # python -m pip install -r requirements-build.txt
 setuptools==80.9.0

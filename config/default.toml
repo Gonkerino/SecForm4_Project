@@ -1,7 +1,14 @@
-# Contact identity must be provided through SEC_USER_AGENT for online discovery.
+# Declared operator identity and email, following SEC's User-Agent example.
+# SEC_USER_AGENT can override this value for an individual run.
 # The data directory is independent of the source repository.
-data_root = "D:/Data/InsiderResearch"
-max_rps = 3.0
+data_root = "D:/Projects/SecForm4/data"
+database_url = "host=127.0.0.1 port=5432 dbname=insider_research user=insider"
+database_schema = "insider_research"
+# Supply the database password through PostgreSQL's password file or PGPASSWORD.
+# INSIDER_DATABASE_URL / INSIDER_DATABASE_SCHEMA override these settings.
+user_agent = "Malcolm MacLeod s2247907@ed.ac.uk"
+max_rps = 10.0
 timeout_seconds = 45.0
 max_attempts = 4
 max_index_bytes = 134217728
+max_submission_bytes = 67108864

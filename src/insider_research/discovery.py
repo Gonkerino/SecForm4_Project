@@ -42,8 +42,7 @@ def preserve_index(cfg: Config, source: IndexSource, body: bytes) -> tuple[str, 
 
 
 def cached_response(catalog: Catalog, cfg: Config, source: IndexSource) -> Response:
-    row = catalog.connection.execute("""SELECT r.* FROM sources s JOIN artifacts r
-        ON r.id=s.current_artifact_id WHERE s.kind=? AND s.period=?""", (source.kind, source.period)).fetchone()
+    row = catalog.cached_artifact(source.kind, source.period)
     if row is None:
         raise ValueError(f"No validated cached index for {source.period}; offline coverage is unresolved")
     path = (cfg.data_root / row["relative_path"]).resolve()
@@ -59,8 +58,6 @@ def cached_response(catalog: Catalog, cfg: Config, source: IndexSource) -> Respo
 def discover(cfg: Config, sources: list[IndexSource], *, local_file: Path | None = None,
              offline: bool = False, accept_removals: bool = False,
              client: HttpClient | None = None, progress=None) -> dict:
-    if not cfg.database.is_file():
-        raise ValueError("Catalogue is not initialized; run 'insider init' first")
     if local_file and len(sources) != 1:
         raise ValueError("Local import requires exactly one source period")
     if not local_file and not offline and client is None:
@@ -68,7 +65,7 @@ def discover(cfg: Config, sources: list[IndexSource], *, local_file: Path | None
     summary = {"sources_requested": len(sources), "sources_validated": 0,
                "sources_unresolved": 0, "ownership_associations_observed": 0,
                "removed_accessions": 0, "errors": []}
-    with publisher_lock(cfg.data_root), Catalog(cfg.database) as catalog:
+    with Catalog(cfg) as catalog, publisher_lock(cfg.data_root, catalog):
         run_id = catalog.start_run("ingest-index" if local_file else "discover", cfg)
         summary["run_id"] = run_id
         active_attempt = None
@@ -97,9 +94,7 @@ def discover(cfg: Config, sources: list[IndexSource], *, local_file: Path | None
                     atomic_write(cfg.data_root / "reports" / run_id / f"attempt-{active_attempt}.json",
                                  json.dumps(receipt, indent=2).encode())
                     parsed = parse_master_index(response.body)
-                    old = {r[0] for r in catalog.connection.execute("""SELECT DISTINCT a.accession
-                        FROM associations a JOIN sources s ON s.current_artifact_id=a.artifact_id
-                        WHERE s.id=?""", (source_id,))}
+                    old = catalog.current_accessions(source_id)
                     removed = old - {r.accession for r in parsed.rows}
                     if removed and not accept_removals:
                         raise ValueError(f"Revision removes {len(removed)} previously indexed accessions; inspect the receipt and use --accept-removals to activate")

@@ -1,27 +1,29 @@
-"""Read-only integrity checks for committed index discovery artifacts."""
+"""Read-only logical checks for PostgreSQL catalogue and preserved index bytes."""
 
 from __future__ import annotations
 
 import gzip
 import hashlib
-import sqlite3
 
 from .catalog import Catalog
 from .config import Config
 
 
-def validate(cfg: Config) -> dict:
+def validate(cfg: Config, *, progress=None) -> dict:
     problems = []
     checked = 0
-    with Catalog(cfg.database) as catalog:
-        # Hold a consistent read transaction while checking catalogue references.
-        catalog.connection.execute("BEGIN")
-        integrity = [r[0] for r in catalog.connection.execute("PRAGMA quick_check")]
-        if integrity != ["ok"]:
-            problems.append({"type": "sqlite_integrity", "details": integrity})
-        foreign = [tuple(r) for r in catalog.connection.execute("PRAGMA foreign_key_check")]
-        if foreign:
-            problems.append({"type": "foreign_keys", "details": foreign})
+    if progress:
+        progress({"event": "loading"})
+    with Catalog(cfg) as catalog, catalog.connection.transaction():
+        catalog.connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        unvalidated = list(catalog.connection.execute("""SELECT c.conname AS name
+            FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace
+            WHERE n.nspname=%s AND NOT c.convalidated""", (cfg.database_schema,)))
+        if unvalidated:
+            problems.append({"type": "unvalidated_constraints", "details": unvalidated})
+        total = catalog.connection.execute("SELECT count(*) AS n FROM artifacts").fetchone()["n"]
+        if progress:
+            progress({"event": "start", "total": total})
         for row in catalog.connection.execute("""SELECT r.*,count(a.row_number) AS actual_rows
             FROM artifacts r LEFT JOIN associations a ON a.artifact_id=r.id GROUP BY r.id"""):
             checked += 1
@@ -43,8 +45,11 @@ def validate(cfg: Config) -> dict:
                     raise ValueError("Catalogue association count differs from parsed ownership count")
             except (ValueError, OSError, EOFError) as exc:
                 problems.append({"type": "artifact", "artifact_id": row["id"], "message": str(exc)})
+            if progress:
+                progress({"event": "progress", "current": checked, "total": total,
+                          "problems": len(problems)})
         unresolved = [r for r in catalog.coverage() if r["latest_attempt_status"] != "validated"]
     return {"status": "valid" if not problems and not unresolved else "incomplete",
-            "artifacts_checked": checked, "problems": problems,
+            "database_backend": "postgresql", "artifacts_checked": checked, "problems": problems,
             "unresolved_sources": len(unresolved),
-            "note": "Checks index storage and catalogue consistency, not submission or transaction coverage."}
+            "note": "Checks constraints, index hashes and catalogue consistency; not PostgreSQL physical integrity or submission coverage."}
