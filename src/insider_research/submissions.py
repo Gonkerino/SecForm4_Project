@@ -8,6 +8,7 @@ import os
 import re
 import uuid
 import zipfile
+import zlib
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
@@ -92,7 +93,7 @@ def _verify_registered_submission(root, row):
         if (digest != row["sha256"] or zip_size != row["zip_bytes"]
                 or source_size != row["source_bytes"]):
             raise ValueError("ZIP checksum or recorded length mismatch")
-    except (OSError, ValueError, zipfile.BadZipFile, EOFError) as exc:
+    except (OSError, ValueError, zipfile.BadZipFile, EOFError, zlib.error) as exc:
         return {"accession": row["accession"], "message": str(exc)}
     return None
 
@@ -155,7 +156,7 @@ def verify_submissions(cfg: Config, *, progress=None, workers=1) -> dict:
 
 
 def download_submissions(cfg: Config, *, start=RESEARCH_START, end=None, form=None, limit=None,
-                         retry_failed=False, workers=10, client=None, progress=None) -> dict:
+                         retry_failed=False, workers=10, client=None, progress=None, accession=None) -> dict:
     if limit is not None and not 1 <= limit <= 10000:
         raise ValueError("Limit must be between 1 and 10000 when supplied")
     if not 1 <= workers <= 20:
@@ -166,20 +167,24 @@ def download_submissions(cfg: Config, *, start=RESEARCH_START, end=None, form=No
         raise ValueError("Unsupported ownership form")
     if client is None:
         client = HttpClient(cfg)
+    selected_accession = accession
     summary = {"submissions_requested": 0, "submissions_downloaded": 0,
                "submissions_failed": 0, "errors": []}
     with Catalog(cfg) as catalog, publisher_lock(cfg.data_root, catalog):
         counts = catalog.submission_counts(start=start.isoformat() if start else None,
-            end=end.isoformat() if end else None, form=form)
-        candidates = catalog.submission_candidates(start=start.isoformat() if start else None,
-            end=end.isoformat() if end else None, form=form, limit=limit, retry_failed=retry_failed)
-        summary["submissions_requested"] = len(candidates)
+            end=end.isoformat() if end else None, form=form, accession=selected_accession)
+        selection = dict(start=start.isoformat() if start else None,
+            end=end.isoformat() if end else None, form=form, accession=selected_accession, retry_failed=retry_failed)
+        eligible = catalog.submission_candidate_count(**selection)
+        requested = min(eligible, limit) if limit else eligible
+        candidates = catalog.submission_candidates(**selection, limit=limit, stream=True)
+        summary["submissions_requested"] = requested
         summary["total_indexed"] = counts["total_indexed"]
         summary["already_downloaded"] = counts["already_downloaded"]
         summary["latest_failed_before_run"] = counts["latest_failed"]
         summary["pending_before_run"] = counts["total_indexed"] - counts["already_downloaded"]
         if progress:
-            progress({"event": "start", "total": len(candidates), **summary})
+            progress({"event": "start", "total": requested, **summary})
         run_id = catalog.start_run("download-submissions", cfg)
         summary["run_id"] = run_id
         state = "succeeded"
@@ -194,10 +199,13 @@ def download_submissions(cfg: Config, *, start=RESEARCH_START, end=None, form=No
             blocked = False
             pending = {}
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sec-download") as pool:
-                while next_candidate < len(candidates) or pending:
-                    while (not blocked and next_candidate < len(candidates)
+                while (not blocked and next_candidate < requested) or pending:
+                    while (not blocked and next_candidate < requested
                            and len(pending) < workers):
-                        filing = candidates[next_candidate]
+                        filing = next(candidates, None)
+                        if filing is None:
+                            next_candidate = requested
+                            break
                         accession, archive_path = filing["accession"], filing["archive_path"]
                         if (not ACCESSION.fullmatch(accession)
                                 or not re.fullmatch(rf"edgar/data/[0-9]{{1,10}}/{re.escape(accession)}\.txt", archive_path)):
@@ -208,6 +216,8 @@ def download_submissions(cfg: Config, *, start=RESEARCH_START, end=None, form=No
                         pending[future] = (accession, attempt_id)
                         next_candidate += 1
 
+                    if not pending:
+                        break
                     done, _ = wait(pending, return_when=FIRST_COMPLETED)
                     for future in done:
                         accession, attempt_id = pending.pop(future)
@@ -217,24 +227,25 @@ def download_submissions(cfg: Config, *, start=RESEARCH_START, end=None, form=No
                                                         source_size, url, attempt_id)
                             summary["submissions_downloaded"] += 1
                             progress_status, error_message = "downloaded", None
-                        except (FetchError, ValueError, OSError, EOFError, zipfile.BadZipFile) as exc:
+                        except (FetchError, ValueError, OSError, EOFError, zipfile.BadZipFile, zlib.error) as exc:
                             status = getattr(exc, "status", None)
                             catalog.finish_submission_attempt(attempt_id, status="failed", error=str(exc), http_status=status)
                             summary["submissions_failed"] += 1
-                            summary["errors"].append({"accession": accession, "message": str(exc)})
+                            if len(summary["errors"]) < 100:
+                                summary["errors"].append({"accession": accession, "message": str(exc)})
                             progress_status, error_message = "failed", str(exc)
                             if status in {403, 429}:
                                 blocked = True
                         completed += 1
                         if progress:
                             progress({"event": "progress", "current": completed,
-                                      "total": len(candidates), "accession": accession,
+                                      "total": requested, "accession": accession,
                                       "status": progress_status, "message": error_message})
 
             if blocked:
-                summary["submissions_not_attempted"] = len(candidates) - completed
+                summary["submissions_not_attempted"] = requested - completed
             after = catalog.submission_counts(start=start.isoformat() if start else None,
-                end=end.isoformat() if end else None, form=form)
+                end=end.isoformat() if end else None, form=form, accession=selected_accession)
             summary["downloaded_after_run"] = after["already_downloaded"]
             summary["remaining_after_run"] = after["total_indexed"] - after["already_downloaded"]
             summary["latest_failed_after_run"] = after["latest_failed"]
@@ -245,7 +256,10 @@ def download_submissions(cfg: Config, *, start=RESEARCH_START, end=None, form=No
             summary["status"] = state
             catalog.finish_run(run_id, state, summary)
         except BaseException as exc:
+            catalog.connection.execute("UPDATE submission_attempts SET status='interrupted',finished_at=now(),error='Download run interrupted' WHERE run_id=%s AND status='running'", (run_id,))
             catalog.finish_run(run_id, "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
                                summary, type(exc).__name__)
             raise
+        finally:
+            candidates.close()
     return summary

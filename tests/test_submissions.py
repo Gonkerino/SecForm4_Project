@@ -61,7 +61,7 @@ class SubmissionTests(unittest.TestCase):
         try:
             Catalog.initialize(legacy)
             with Catalog(legacy) as catalog:
-                self.assertEqual(catalog.status()["schema_version"], 2)
+                self.assertEqual(catalog.status()["schema_version"], 4)
                 self.assertEqual(catalog.status()["unique_filings_ever_observed"], 1)
                 self.assertEqual(catalog.status()["submissions_downloaded"], 0)
         finally:
@@ -127,13 +127,13 @@ class SubmissionTests(unittest.TestCase):
             self.assertEqual(cat.submission_candidates(), [])
             self.assertEqual(len(cat.submission_candidates(retry_failed=True)), 1)
 
-    def test_recovery_marks_abandoned_filing_attempt(self):
+    def test_keyboard_interrupt_reconciles_attempt_before_recovery(self):
         client = FakeClient(KeyboardInterrupt())
         with self.assertRaises(KeyboardInterrupt):
             download_submissions(self.cfg, client=client)
         with Catalog(self.cfg) as cat, publisher_lock(self.cfg.data_root, cat):
             recovered = cat.recover()
-            self.assertEqual(recovered["submission_attempts_reconciled"], 1)
+            self.assertEqual(recovered["submission_attempts_reconciled"], 0)
             attempt = cat.connection.execute("SELECT status FROM submission_attempts").fetchone()
             self.assertEqual(attempt["status"], "interrupted")
         resumed = download_submissions(self.cfg, client=FakeClient(DOCUMENT))

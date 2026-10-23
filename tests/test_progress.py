@@ -49,7 +49,7 @@ class ProgressTests(unittest.TestCase):
 
         output, errors = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors), \
-                patch("insider_research.cli.verify_submissions", side_effect=verify):
+                patch("insider_research.legacy_cli.verify_submissions", side_effect=verify):
             self.assertEqual(main(["validate-submissions"]), 2)
         self.assertEqual(json.loads(output.getvalue())["status"], "incomplete")
         self.assertIn("problems=1", errors.getvalue())

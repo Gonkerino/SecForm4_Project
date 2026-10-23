@@ -1,0 +1,165 @@
+<SEC-DOCUMENT>0000002230-20-000001.txt : 20200127
+<SEC-HEADER>0000002230-20-000001.hdr.sgml : 20200127
+<ACCEPTANCE-DATETIME>20200127090912
+ACCESSION NUMBER:		0000002230-20-000001
+CONFORMED SUBMISSION TYPE:	5
+PUBLIC DOCUMENT COUNT:		1
+CONFORMED PERIOD OF REPORT:	20191231
+FILED AS OF DATE:		20200127
+DATE AS OF CHANGE:		20200127
+
+REPORTING-OWNER:	
+
+	OWNER DATA:	
+		COMPANY CONFORMED NAME:			Stoeckle Mark E.
+		CENTRAL INDEX KEY:			0001569600
+
+	FILING VALUES:
+		FORM TYPE:		5
+		SEC ACT:		1934 Act
+		SEC FILE NUMBER:	811-00248
+		FILM NUMBER:		20547246
+
+	MAIL ADDRESS:	
+		STREET 1:		ADAMS FUNDS
+		STREET 2:		500 EAST PRATT ST., STE. 1300
+		CITY:			BALTIMORE
+		STATE:			MD
+		ZIP:			21202
+
+ISSUER:		
+
+	COMPANY DATA:	
+		COMPANY CONFORMED NAME:			ADAMS DIVERSIFIED EQUITY FUND, INC.
+		CENTRAL INDEX KEY:			0000002230
+		IRS NUMBER:				134912740
+		STATE OF INCORPORATION:			MD
+		FISCAL YEAR END:			1231
+
+	BUSINESS ADDRESS:	
+		STREET 1:		500 EAST PRATT STREET
+		STREET 2:		SUITE 1300
+		CITY:			BALTIMORE
+		STATE:			MD
+		ZIP:			21202
+		BUSINESS PHONE:		4107525900
+
+	MAIL ADDRESS:	
+		STREET 1:		500 EAST PRATT STREET
+		STREET 2:		SUITE 1300
+		CITY:			BALTIMORE
+		STATE:			MD
+		ZIP:			21202
+
+	FORMER COMPANY:	
+		FORMER CONFORMED NAME:	ADAMS DIVERSIFIED EQUITY FUND
+		DATE OF NAME CHANGE:	20150331
+
+	FORMER COMPANY:	
+		FORMER CONFORMED NAME:	ADAMS EXPRESS CO
+		DATE OF NAME CHANGE:	19920703
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>5
+<SEQUENCE>1
+<FILENAME>primary_doc.xml
+<DESCRIPTION>PRIMARY DOCUMENT
+<TEXT>
+<XML>
+<?xml version="1.0"?>
+<ownershipDocument>
+
+    <schemaVersion>X0306</schemaVersion>
+
+    <documentType>5</documentType>
+
+    <periodOfReport>2019-12-31</periodOfReport>
+
+    <notSubjectToSection16>0</notSubjectToSection16>
+
+    <form3HoldingsReported>0</form3HoldingsReported>
+
+    <form4TransactionsReported>0</form4TransactionsReported>
+
+    <issuer>
+        <issuerCik>0000002230</issuerCik>
+        <issuerName>ADAMS DIVERSIFIED EQUITY FUND, INC.</issuerName>
+        <issuerTradingSymbol>ADX</issuerTradingSymbol>
+    </issuer>
+
+    <reportingOwner>
+        <reportingOwnerId>
+            <rptOwnerCik>0001569600</rptOwnerCik>
+            <rptOwnerName>Stoeckle Mark E.</rptOwnerName>
+        </reportingOwnerId>
+        <reportingOwnerAddress>
+            <rptOwnerStreet1>ADAMS FUNDS</rptOwnerStreet1>
+            <rptOwnerStreet2>500 EAST PRATT ST., STE. 1300</rptOwnerStreet2>
+            <rptOwnerCity>BALTIMORE</rptOwnerCity>
+            <rptOwnerState>MD</rptOwnerState>
+            <rptOwnerZipCode>21202</rptOwnerZipCode>
+            <rptOwnerStateDescription></rptOwnerStateDescription>
+        </reportingOwnerAddress>
+        <reportingOwnerRelationship>
+            <isDirector>1</isDirector>
+            <isOfficer>1</isOfficer>
+            <isTenPercentOwner>0</isTenPercentOwner>
+            <isOther>0</isOther>
+            <officerTitle>CEO &amp; President</officerTitle>
+        </reportingOwnerRelationship>
+    </reportingOwner>
+
+    <nonDerivativeTable>
+        <nonDerivativeTransaction>
+            <securityTitle>
+                <value>Common Stock</value>
+            </securityTitle>
+            <transactionDate>
+                <value>2019-12-31</value>
+            </transactionDate>
+            <transactionCoding>
+                <transactionFormType>5</transactionFormType>
+                <transactionCode>J</transactionCode>
+                <equitySwapInvolved>0</equitySwapInvolved>
+            </transactionCoding>
+            <transactionTimeliness>
+                <value></value>
+            </transactionTimeliness>
+            <transactionAmounts>
+                <transactionShares>
+                    <value>4101.766</value>
+                    <footnoteId id="F1"/>
+                </transactionShares>
+                <transactionPricePerShare>
+                    <value>0</value>
+                </transactionPricePerShare>
+                <transactionAcquiredDisposedCode>
+                    <value>A</value>
+                </transactionAcquiredDisposedCode>
+            </transactionAmounts>
+            <postTransactionAmounts>
+                <sharesOwnedFollowingTransaction>
+                    <value>71264.469</value>
+                </sharesOwnedFollowingTransaction>
+            </postTransactionAmounts>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>D</value>
+                </directOrIndirectOwnership>
+            </ownershipNature>
+        </nonDerivativeTransaction>
+    </nonDerivativeTable>
+
+    <footnotes>
+        <footnote id="F1">These shares were acquired in exempt transactions as a result of dividend reinvestments, thrift plan employee contributions and employer matching contributions.  The Issuer's stock traded in a range of $12.37 - $16.76 during 2019.</footnote>
+    </footnotes>
+
+    <ownerSignature>
+        <signatureName>Gail L. Valenti as Attorney-in-Fact for Mark E. Stoeckle</signatureName>
+        <signatureDate>2020-01-27</signatureDate>
+    </ownerSignature>
+</ownershipDocument>
+</XML>
+</TEXT>
+</DOCUMENT>
+</SEC-DOCUMENT>

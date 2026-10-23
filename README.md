@@ -2,9 +2,28 @@
 
 SEC ownership research infrastructure for Forms **3, 3/A, 4, 4/A, 5 and 5/A**. The current milestone is a **PostgreSQL filing catalogue**: discover filings from original EDGAR master indexes, preserve source bytes, and track accession identities separately from indexed entity/path associations.
 
-**Implemented:** initialization, quarterly/daily discovery, offline index import/replay, revision history, filing-level full submission downloads in verified ZIP archives, retry/recovery tracking, coverage, queries and integrity validation. **Not yet implemented:** ownership parsing, analytical snapshots, prices, models, signals or scheduling. Discovery downloads index metadata only; submission downloads run as a separate explicit command.
+**Implemented:** initialization, quarterly/daily discovery, offline index import/replay, revision history, filing-level full submission downloads in verified ZIP archives, retry/recovery tracking, coverage, queries and integrity validation. **Also implemented:** versioned local ownership XML extraction, inspection and source-replay validation. **Not yet implemented:** analytical snapshots, feature engineering, prices, models, signals or scheduling. Discovery downloads index metadata only; submission downloads run as a separate explicit command.
 
 The application uses PostgreSQL exclusively. There is no SQLite fallback or automatic import of old data. Initialization creates an empty schema and never downloads filings; repeating it preserves existing records.
+
+## Daily workflow
+
+```powershell
+insider discover --source quarterly --start 2003-07-01 --end 2026-10-23
+insider download
+insider parse
+insider status
+```
+
+For integrity and recovery: **`insider check` -> `insider issues` -> `insider repair --dry-run` -> `insider repair`**.
+Use `insider show ACCESSION` to inspect a filing, and `insider dashboard` for acquisition coverage.
+Add `--json` for machine output. Preview acquisition/parsing with `--dry-run`.
+Discovery and downloading remain separate explicit steps.
+
+Run **`insider admin init`** once after updating to upgrade to schema 4; it preserves existing data and refuses to overlap an active writer.
+The [CLI guide](docs/cli.md) documents all commands, filters, retry rules, persistent checks and repair guarantees.
+Old command names below remain compatible, including their JSON output; they are hidden from main help.
+The new `download` command defaults to all indexed dates, while the legacy `download-submissions` command retains its 2003-07-01 cutoff.
 
 ## Installed on this Windows account
 
@@ -143,7 +162,7 @@ The dashboard begins in July 2003. `filings` and `download-submissions` default 
 
 Discovery requires explicit dates and still accepts the general index range from July 1994. Use `--start 2003-07-01` for the principal research period. Whole-quarter discovery may include dates outside a partial-quarter selection. Earlier catalogue records and downloaded files are retained.
 
-Voluntary electronic ownership filing became effective on 18 December 1995 ([SEC announcement](https://www.sec.gov/news/digest/1995/dig111495.pdf)). Pre-mandate electronic records omit paper reports and remain supplementary archival data. Forecasting must use when information became publicly available, rather than treating a transaction date as the date the market knew about it. Transaction parsing, publication-time research snapshots, market prices and statistical evaluation remain future work.
+Voluntary electronic ownership filing became effective on 18 December 1995 ([SEC announcement](https://www.sec.gov/news/digest/1995/dig111495.pdf)). Pre-mandate electronic records omit paper reports and remain supplementary archival data. Forecasting must use when information became publicly available, rather than treating a transaction date as the date the market knew about it. Ownership extraction is available; publication-time research snapshots, market prices and statistical evaluation remain future work.
 
 ## Local dashboard
 
@@ -159,7 +178,7 @@ The server binds only to loopback, checks request hosts, serves bundled assets, 
 
 ## Upgrading an existing catalogue
 
-The current catalogue schema is **version 2**. After updating the Python package, run `insider --config config/default.toml init` again. This applies `002_submissions.sql` to a version-1 PostgreSQL catalogue, adding submission archives and attempt tracking while preserving index records. Other commands require version 2 and do not migrate automatically. Unknown schema versions are rejected. Back up the database and artifacts before an upgrade.
+The current catalogue schema is **version 3**. After updating the Python package, run `insider --config config/default.toml init` again after any running writer finishes. It applies migrations in order: `002_submissions.sql` adds submission tracking, and `003_ownership.sql` adds extraction tables. Existing index records and downloads are preserved. Other commands require version 3 and do not migrate automatically. Unknown schema versions are rejected. Back up the database and artifacts before an upgrade.
 
 ## Configuration and identity
 
@@ -233,11 +252,45 @@ insider validate-submissions
 
 Each archive is stored at `raw/submissions/accession=<first 10 accession digits>/<accession>.zip`, with the original SEC text at the ZIP root as `<accession>.txt`. The raw submission bytes are retained unchanged inside the ZIP. The catalogue records the ZIP SHA-256, ZIP/source lengths, source URL and download time. Downloads use the configured SEC identity, pacing, HTTPS-only SEC redirects, bounded response sizes, timeouts and retries. Before publication, responses must be nonempty, contain no null bytes, and include SEC document/header markers and the requested accession in the first 64 KiB. These checks reject common error responses; they do not fully parse or establish completeness of the SGML document. Files are written to a temporary ZIP, reopened and checksum-verified, then atomically renamed; PostgreSQL marks the filing downloaded only after publication. The publisher lock prevents overlapping writers.
 
-Failed filings remain visible in attempt history and do not count as downloaded. HTTP 403 or a final HTTP 429 failure stops scheduling new downloads; already dispatched workers finish. Rerunning skips verified catalogue entries, resumes unattempted/interrupted filings, and leaves latest failures for an explicit `--retry-failed`. Files published just before a crash but not registered in PostgreSQL are safely replaced on retry. `recover` marks their in-progress attempts interrupted. Downloading the full historical set can take substantial time and disk space; `--limit` and filters let you build coverage in smaller batches. The final JSON reports the indexed total, requested/downloaded/failed counts, remaining count and `coverage_complete` for the selected current catalogue entries. Exit status 0 means the queued batch succeeded; excluded failures or a batch limit can still leave `coverage_complete` false. Registered archives are skipped without rechecking disk contents on every run; use `validate-submissions` to detect missing or damaged ZIPs. This step does not parse ownership transactions or download issuer/owner exhibits separately.
+Failed filings remain visible in attempt history and do not count as downloaded. HTTP 403 or a final HTTP 429 failure stops scheduling new downloads; already dispatched workers finish. Rerunning skips verified catalogue entries, resumes unattempted/interrupted filings, and leaves latest failures for an explicit `--retry-failed`. Files published just before a crash but not registered in PostgreSQL are safely replaced on retry. `recover` marks their in-progress attempts interrupted. Downloading the full historical set can take substantial time and disk space; `--limit` and filters let you build coverage in smaller batches. The final JSON reports the indexed total, requested/downloaded/failed counts, remaining count and `coverage_complete` for the selected current catalogue entries. Exit status 0 means the queued batch succeeded; excluded failures or a batch limit can still leave `coverage_complete` false. Registered archives are skipped without rechecking disk contents on every run; use `validate-submissions` to detect missing or damaged ZIPs. This download step does not parse ownership transactions or download issuer/owner exhibits separately; use the local extraction commands below.
 
 Back up **both** PostgreSQL and the data root: preserved source bytes remain on disk. Use PostgreSQL backup tools such as `pg_dump` for a consistent database backup. Copying `D:/Projects/SecForm4/data` alone does not back up the catalogue. Keep the data-root path when restoring; automatic relocation is not implemented. The project-local `data/` directory is ignored by Git. See [architecture](docs/architecture.md).
 
 Exit codes: 0 success, 1 operational error, 2 incomplete discovery/download batch or failed validation, 64 invalid arguments, 130 interruption. Header-only indexes are unresolved; valid indexes containing other forms but no ownership forms are valid zero-ownership sources.
+
+## Parse downloaded ownership filings
+
+After applying schema 3 with `insider init` (wait for running discovery/download
+writers to finish), extract all registered downloaded Forms 3/4/5 and amendments:
+
+```powershell
+insider plan-parse
+insider --offline parse-ownership --limit 100
+insider parsing-status
+insider validate-ownership
+insider --offline parse-ownership
+insider inspect-ownership 0000001750-26-000002
+```
+
+Parsing uses no SEC requests. It stores typed reports, owners, transactions,
+holdings, signatures, complete footnotes and field links, header/document metadata,
+and a source-field inventory in PostgreSQL. Exact prices/quantities use decimal
+arithmetic. Joint owners do not multiply transaction rows; amendments remain
+separate evidence. No features, role inference or analysis are performed.
+
+The default covers **all registered downloads** with no research-date cutoff.
+`--start`/`--end` filter historical indexed filing dates; `--form` and `--accession`
+are also supported. Reruns skip the same source/parser result; `--retry-failed`
+includes previous failed/unsupported attempts. Unknown content is preserved and
+flagged for review. Each verified source also gets an immutable ZIP copy beneath
+`raw/submission_versions/`, requiring additional disk space roughly equal to the
+original ZIPs. Preserve these copies in backups.
+
+`validate-ownership` replays retained sources and checks stored extraction fidelity;
+it does not repair files or claim the source is true. Use `parsing-status` to see
+review/failure cases. The monthly dashboard continues to show download coverage.
+See [ownership extraction](docs/ownership-parsing.md) for table meanings, current
+SQL views, missing-value rules, versioning and recovery.
 
 ## Tests
 

@@ -8,7 +8,7 @@ Configuration defaults to `config/default.toml` located relative to the installe
 
 Psycopg 3 connects to an existing PostgreSQL database using `database_url` (environment override: `INSIDER_DATABASE_URL`). Passwords may come from libpq's password file or `PGPASSWORD`. Connection strings are excluded from configuration repr/public settings/reports; CLI database errors are redacted.
 
-All application objects live in a dedicated `database_schema`, default `insider_research`. Initialization obtains a database advisory transaction lock, creates an empty schema transactionally, and records `schema_version` and the bound `data_root` in `metadata`. It rejects unknown versions, unrelated nonempty schemas and conflicting data-root bindings. The current schema version is 2. `init` upgrades version 1 transactionally using `002_submissions.sql`, adding submission tables while preserving existing index records; ordinary catalogue connections require version 2. Repeated initialization preserves records. Server/role/database provisioning is separate in `scripts/create_catalogue.sql`.
+All application objects live in a dedicated `database_schema`, default `insider_research`. Initialization obtains a database advisory transaction lock, creates an empty schema transactionally, and records `schema_version` and the bound `data_root` in `metadata`. It rejects unknown versions, unrelated nonempty schemas and conflicting data-root bindings. The current schema version is 3. `init` upgrades versions 1 and 2 transactionally and in order using `002_submissions.sql` and `003_ownership.sql`, adding submission and extraction tables while preserving existing acquisition records; ordinary catalogue connections require version 3. Repeated initialization preserves records. Server/role/database provisioning is separate in `scripts/create_catalogue.sql`.
 
 - `filings`: one accession identity and first/last observation times; no guessed issuer.
 - `sources`: kind/period, URL and current validated artifact pointer.
@@ -42,7 +42,7 @@ The default worker count is 10, configurable from 1 to 20. Workers share one HTT
 
 Before writing a ZIP, publication rejects empty/null-containing responses and requires SEC document/header markers plus the requested accession in the first 64 KiB. This is a response sanity check rather than full SGML parsing or proof of document completeness. ZIP publication uses fixed entry metadata, DEFLATE compression, a unique temporary file, file fsync, content verification and atomic replacement. Registration and the successful attempt state then commit together.
 
-`validate-submissions` checks registered archive paths stay inside the data root, verifies the single expected entry, reads it fully, and compares ZIP SHA-256 and ZIP/source lengths with PostgreSQL. It does not establish download coverage, adopt orphan ZIPs or update `last_verified_at`. Downloads skip registered archives without a fresh disk check; damaged archives require explicit repair outside the current automatic retry flow.
+`validate-submissions` checks registered archive paths stay inside the data root, verifies the single expected entry, reads it fully, and compares ZIP SHA-256 and ZIP/source lengths with PostgreSQL. It does not establish download coverage, adopt orphan ZIPs or update `last_verified_at`. Downloads skip registered archives without a fresh disk check; damaged archives are diagnosed by `check` and restored by `repair`, independently of acquisition retries.
 
 ## Source behavior
 
@@ -58,7 +58,7 @@ Code and the ignored data root live under `D:/Projects/SecForm4`; files default 
 
 This Windows account has a per-user PostgreSQL 18.6 installation at `%LOCALAPPDATA%/Programs/PostgreSQL/18`, with a cluster at `D:/Projects/SecForm4/data/postgres`. It listens on `127.0.0.1:5432` with SCRAM authentication. A user Startup shortcut starts it in the background at login; `scripts/postgres.py` controls it manually. Passwords are stored in the account's protected libpq password file, never in repository configuration. The application and test databases have separate non-superuser owner logins; the test login cannot connect to the working database.
 
-Integration tests use a separately configured PostgreSQL test database, randomly named schemas and temporary artifact roots. Integration fixtures are isolated from the working application schema. Ownership parsing, analytical snapshots, market data, models, signals and scheduling remain outside current functionality.
+Integration tests use a separately configured PostgreSQL test database, randomly named schemas and temporary artifact roots. Integration fixtures are isolated from the working application schema. Local versioned ownership extraction is implemented; analytical snapshots, feature engineering, market data, models, signals and scheduling remain outside current functionality. See [ownership extraction](ownership-parsing.md) for source preservation, tables, commands and validation.
 
 ## Local dashboard
 
@@ -68,8 +68,26 @@ One repeatable-read, read-only PostgreSQL transaction aggregates current associa
 
 The browser refreshes every ten seconds while visible and exposes monthly counts on hover, focus or tap. Arrow keys, Home and End navigate the strip. There are no background jobs or operation controls in the dashboard. The server checks Host headers, uses bundled assets with a restrictive content policy, and requires no new dependencies or schema migrations. It is intended for local account use, not remote hosting.
 
-The main research dataset starts on **1 July 2003**, the first full month after electronic ownership filing became mandatory on 30 June 2003 ([SEC rule](https://www.sec.gov/files/rules/final/33-8230.htm)). `config.RESEARCH_START` is the shared boundary for the dashboard, default CLI filing listings/downloads and the Python submission-download entry point. Explicit earlier CLI dates remain supported. Status, validation and low-level catalogue queries cover all retained records. No historical observations or files are deleted.
+The main research dataset starts on **1 July 2003**, the first full month after electronic ownership filing became mandatory on 30 June 2003 ([SEC rule](https://www.sec.gov/files/rules/final/33-8230.htm)). `config.RESEARCH_START` is the shared boundary for the dashboard, legacy CLI filing listings/downloads and the Python submission-download entry point. Explicit earlier CLI dates remain supported. Status, validation and low-level catalogue queries cover all retained records. No historical observations or files are deleted.
 
-The general index planner retains its July 1994 lower bound and requires explicit dates; use a start of 2003-07-01 for principal research discovery. Voluntary electronic ownership filing began on 18 December 1995 ([SEC announcement](https://www.sec.gov/news/digest/1995/dig111495.pdf)); pre-mandate electronic records omit paper reports and remain supplementary archival data. Future forecasting datasets must use public information-availability timing to avoid look-ahead bias. Transaction parsing, publication-time research snapshots, market-price alignment and statistical evaluation remain outside current functionality.
+The general index planner retains its July 1994 lower bound and requires explicit dates; use a start of 2003-07-01 for principal research discovery. Voluntary electronic ownership filing began on 18 December 1995 ([SEC announcement](https://www.sec.gov/news/digest/1995/dig111495.pdf)); pre-mandate electronic records omit paper reports and remain supplementary archival data. Future forecasting datasets must use public information-availability timing to avoid look-ahead bias. Ownership extraction is available; publication-time research snapshots, market-price alignment and statistical evaluation remain outside current functionality.
 
 Unindexed months have a separate grey state: no monthly filing observations or applicable active index source. A validated daily source or a quarterly observation reaching the month establishes index presence even for zero ownership rows; it does not necessarily establish full-month coverage. The coverage endpoint also returns the latest validated index attempt timestamp/source, labelled when offline. Failed attempts and submission downloads do not advance this timestamp. The UI separately timestamps its last successful fetch and renders both times in Europe/London.
+
+
+## Unified operations and schema 4
+
+The public CLI separates `discover`, `download`, and `parse`; `status` and `show`
+combine their views. `check` writes version-specific receipts and immutable
+observations. `issues` combines those findings with current acquisition attempts
+and parser review cases. `repair` rechecks under the publisher lock, restores
+exact source bytes, rebuilds damaged index projections from preserved evidence,
+and publishes validated extraction revisions transactionally. Previous results
+and damaged bytes remain available. See [the CLI guide](cli.md) for guarantees,
+selection semantics, compatibility and operational limits.
+
+`health_checks` records check scope and completion, `health_observations` preserves
+each outcome, `health_receipts` stores the latest per-object/version outcome,
+and `repair_attempts` audits repair outcomes. `parse_results.supersedes_result_id`
+links extraction repairs. Normal parsing remains idempotent; controlled repair
+can publish another result for the same source and parser version.

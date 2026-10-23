@@ -15,7 +15,7 @@ from psycopg.types.json import Jsonb
 
 from .config import Config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -73,7 +73,7 @@ class Catalog:
             raise ValueError("PostgreSQL catalogue is not initialized; run 'insider init' first")
         metadata = {r["key"]: r["value"] for r in self.connection.execute("SELECT * FROM metadata")}
         if metadata.get("schema_version") != str(SCHEMA_VERSION):
-            raise ValueError(f"Unsupported catalogue schema {metadata.get('schema_version')}; expected {SCHEMA_VERSION}")
+            raise ValueError(f"Unsupported catalogue schema {metadata.get('schema_version')}; expected {SCHEMA_VERSION}; run insider admin init")
         if metadata.get("data_root") != str(self.cfg.data_root):
             raise ValueError("PostgreSQL catalogue belongs to a different data_root; use its configured directory")
 
@@ -109,11 +109,13 @@ class Catalog:
                 connection.execute("INSERT INTO metadata(key,value) VALUES ('data_root',%s)", (str(cfg.data_root),))
             metadata = {r["key"]: r["value"] for r in connection.execute("SELECT * FROM metadata")}
             version = metadata.get("schema_version")
-            if version == "1":
-                migration = files("insider_research").joinpath("migrations/002_submissions.sql").read_text(encoding="utf-8-sig")
-                connection.execute(migration)
-            elif version != str(SCHEMA_VERSION):
+            if version not in ("1", "2", "3", str(SCHEMA_VERSION)):
                 raise ValueError(f"Unsupported catalogue schema {version}")
+            for target, filename in ((2, "002_submissions.sql"), (3, "003_ownership.sql"), (4, "004_health.sql")):
+                if int(version) < target:
+                    migration = files("insider_research").joinpath("migrations/" + filename).read_text(encoding="utf-8-sig")
+                    connection.execute(migration)
+                    version = str(target)
             if metadata.get("data_root") not in (None, str(cfg.data_root)):
                 raise ValueError("PostgreSQL catalogue belongs to a different data_root")
             cfg.data_root.mkdir(parents=True, exist_ok=True)
@@ -199,7 +201,7 @@ class Catalog:
                 WHERE b.source_id=a.source_id) AND a.status!='validated') AS failed_latest_attempts,
             (SELECT count(*) FROM runs WHERE status='running') AS running_runs""").fetchone()
         return {"database_backend": "postgresql", "schema_version": SCHEMA_VERSION, **result,
-                "note": "Ownership parsing, analytical snapshots, market prices and signals are not implemented yet."}
+                "note": "Use parsing-status for ownership extraction. Market prices, features and signals are not implemented."}
 
     def coverage(self) -> list[dict]:
         rows = list(self.connection.execute("""SELECT s.kind,s.period,
@@ -240,12 +242,20 @@ class Catalog:
                 error='Previous writer exited before finishing this run' WHERE status='running'""", (utc_now(),)).rowcount
             submissions = self.connection.execute("""UPDATE submission_attempts SET status='interrupted',finished_at=%s,
                 error='Previous writer exited before finishing this attempt' WHERE status='running'""", (utc_now(),)).rowcount
-        return {"runs_reconciled": runs, "attempts_reconciled": attempts,
+            parses = self.connection.execute("""UPDATE parse_attempts SET status='interrupted',finished_at=%s,
+                error='Previous writer exited before finishing this attempt' WHERE status='running'""", (utc_now(),)).rowcount
+            checks = self.connection.execute("UPDATE health_checks SET status='interrupted',finished_at=now() WHERE status='running'").rowcount
+            repairs = self.connection.execute("UPDATE repair_attempts SET status='interrupted',finished_at=now() WHERE status='running'").rowcount
+        return {"checks_reconciled": checks, "repairs_reconciled": repairs, "runs_reconciled": runs, "attempts_reconciled": attempts,
                 "submission_attempts_reconciled": submissions,
+                "parse_attempts_reconciled": parses,
                 "note": "Committed revisions are preserved. Repeat the original discovery command to resume unresolved sources."}
 
-    def _submission_filter(self, start=None, end=None, form=None):
+    def _submission_filter(self, start=None, end=None, form=None, accession=None):
         conditions, parameters = [], []
+        if accession is not None:
+            conditions.append("a.accession = %s")
+            parameters.append(accession)
         if start is not None:
             conditions.append("a.filed_date >= %s")
             parameters.append(start)
@@ -257,19 +267,22 @@ class Catalog:
             parameters.append(form)
         return (" AND ".join(conditions) if conditions else "TRUE"), parameters
 
-    def submission_counts(self, *, start=None, end=None, form=None):
-        where, parameters = self._submission_filter(start, end, form)
-        return self.connection.execute(f"""SELECT count(DISTINCT a.accession) AS total_indexed,
-            count(DISTINCT a.accession) FILTER (WHERE s.accession IS NOT NULL) AS already_downloaded,
-            count(DISTINCT a.accession) FILTER (WHERE latest.status='failed') AS latest_failed
-            FROM current_associations a
+    def submission_counts(self, *, start=None, end=None, form=None, accession=None):
+        where, parameters = self._submission_filter(start, end, form, accession)
+        return self.connection.execute(f"""WITH selected AS MATERIALIZED (
+            SELECT DISTINCT a.accession FROM current_associations a WHERE {where}
+            ), failed AS (
+            SELECT sa.accession FROM submission_attempts sa WHERE sa.status='failed'
+            AND sa.id=(SELECT max(id) FROM submission_attempts newer WHERE newer.accession=sa.accession)
+            ) SELECT count(*) AS total_indexed,
+            count(*) FILTER (WHERE s.accession IS NOT NULL) AS already_downloaded,
+            count(*) FILTER (WHERE s.accession IS NULL AND failed.accession IS NOT NULL) AS latest_failed
+            FROM selected a
             LEFT JOIN submissions s ON s.accession=a.accession
-            LEFT JOIN LATERAL (SELECT sa.status FROM submission_attempts sa
-                WHERE sa.accession=a.accession ORDER BY sa.id DESC LIMIT 1) latest ON TRUE
-            WHERE {where}""", parameters).fetchone()
+            LEFT JOIN failed ON failed.accession=a.accession""", parameters).fetchone()
 
-    def submission_candidates(self, *, start=None, end=None, form=None, limit=None, retry_failed=False):
-        where, parameters = self._submission_filter(start, end, form)
+    def submission_candidates(self, *, start=None, end=None, form=None, accession=None, limit=None, retry_failed=False, count_only=False, stream=False):
+        where, parameters = self._submission_filter(start, end, form, accession)
         if not retry_failed:
             where += """ AND NOT EXISTS (SELECT 1 FROM submission_attempts sa WHERE sa.accession=f.accession
                 AND sa.status='failed' AND sa.id=(SELECT max(last_sa.id) FROM submission_attempts last_sa
@@ -278,10 +291,26 @@ class Catalog:
             FROM current_associations a JOIN filings f USING(accession)
             WHERE {where} AND NOT EXISTS (SELECT 1 FROM submissions s WHERE s.accession=f.accession)
             GROUP BY f.accession ORDER BY min(a.filed_date),f.accession"""
+        if count_only:
+            return self.connection.execute("SELECT count(*) AS n FROM (" + query + ") candidates", parameters).fetchone()["n"]
         if limit is not None:
             query += " LIMIT %s"
             parameters.append(limit)
+        if stream:
+            def rows():
+                # Separate read snapshot: publication commits stay incremental,
+                # while a multi-million-filing queue uses bounded Python memory.
+                with connect(self.cfg) as connection, connection.transaction():
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    with connection.cursor(name="download_candidates") as cursor:
+                        cursor.itersize = 256
+                        cursor.execute(query, parameters)
+                        yield from cursor
+            return rows()
         return list(self.connection.execute(query, parameters))
+
+    def submission_candidate_count(self, **filters):
+        return self.submission_candidates(count_only=True, **filters)
 
     def begin_submission_attempt(self, run_id: str, accession: str) -> int:
         with self.connection.transaction():

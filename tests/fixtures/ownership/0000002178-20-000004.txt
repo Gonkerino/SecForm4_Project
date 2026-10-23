@@ -1,0 +1,183 @@
+<SEC-DOCUMENT>0000002178-20-000004.txt : 20200121
+<SEC-HEADER>0000002178-20-000004.hdr.sgml : 20200121
+<ACCEPTANCE-DATETIME>20200121160418
+ACCESSION NUMBER:		0000002178-20-000004
+CONFORMED SUBMISSION TYPE:	3
+PUBLIC DOCUMENT COUNT:		1
+CONFORMED PERIOD OF REPORT:	20200121
+FILED AS OF DATE:		20200121
+DATE AS OF CHANGE:		20200121
+
+REPORTING-OWNER:	
+
+	OWNER DATA:	
+		COMPANY CONFORMED NAME:			Harrison Wade M
+		CENTRAL INDEX KEY:			0001800389
+
+	FILING VALUES:
+		FORM TYPE:		3
+		SEC ACT:		1934 Act
+		SEC FILE NUMBER:	001-07908
+		FILM NUMBER:		20536453
+
+	MAIL ADDRESS:	
+		STREET 1:		C/O ADAMS RESOURCES & ENERGY, INC.
+		STREET 2:		17 S. BRIAR HOLLOW LANE
+		CITY:			HOUSTON
+		STATE:			TX
+		ZIP:			77027
+
+ISSUER:		
+
+	COMPANY DATA:	
+		COMPANY CONFORMED NAME:			ADAMS RESOURCES & ENERGY, INC.
+		CENTRAL INDEX KEY:			0000002178
+		STANDARD INDUSTRIAL CLASSIFICATION:	WHOLESALE-PETROLEUM & PETROLEUM PRODUCTS (NO BULK STATIONS) [5172]
+		IRS NUMBER:				741753147
+		STATE OF INCORPORATION:			DE
+		FISCAL YEAR END:			1231
+
+	BUSINESS ADDRESS:	
+		STREET 1:		17 S. BRIAR HOLLOW LN.
+		CITY:			HOUSTON
+		STATE:			TX
+		ZIP:			77027
+		BUSINESS PHONE:		713-881-3600
+
+	MAIL ADDRESS:	
+		STREET 1:		P O BOX 844
+		CITY:			HOUSTON
+		STATE:			TX
+		ZIP:			77001
+
+	FORMER COMPANY:	
+		FORMER CONFORMED NAME:	ADAMS RESOURCES & ENERGY INC
+		DATE OF NAME CHANGE:	19920703
+
+	FORMER COMPANY:	
+		FORMER CONFORMED NAME:	ADA RESOURCES INC
+		DATE OF NAME CHANGE:	19790620
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>3
+<SEQUENCE>1
+<FILENAME>wf-form3_157964064046658.xml
+<DESCRIPTION>FORM 3
+<TEXT>
+<XML>
+<?xml version="1.0"?>
+<ownershipDocument>
+
+    <schemaVersion>X0206</schemaVersion>
+
+    <documentType>3</documentType>
+
+    <periodOfReport>2020-01-21</periodOfReport>
+
+    <noSecuritiesOwned>0</noSecuritiesOwned>
+
+    <issuer>
+        <issuerCik>0000002178</issuerCik>
+        <issuerName>ADAMS RESOURCES &amp; ENERGY, INC.</issuerName>
+        <issuerTradingSymbol>AE</issuerTradingSymbol>
+    </issuer>
+
+    <reportingOwner>
+        <reportingOwnerId>
+            <rptOwnerCik>0001800389</rptOwnerCik>
+            <rptOwnerName>Harrison Wade M</rptOwnerName>
+        </reportingOwnerId>
+        <reportingOwnerAddress>
+            <rptOwnerStreet1>17 SOUTH BRIAR HOLLOW LANE</rptOwnerStreet1>
+            <rptOwnerStreet2>SUITE 100</rptOwnerStreet2>
+            <rptOwnerCity>HOUSTON</rptOwnerCity>
+            <rptOwnerState>TX</rptOwnerState>
+            <rptOwnerZipCode>77027</rptOwnerZipCode>
+            <rptOwnerStateDescription></rptOwnerStateDescription>
+        </reportingOwnerAddress>
+        <reportingOwnerRelationship>
+            <isDirector>0</isDirector>
+            <isOfficer>1</isOfficer>
+            <isTenPercentOwner>0</isTenPercentOwner>
+            <isOther>0</isOther>
+            <officerTitle>President, Service Transport</officerTitle>
+            <otherText></otherText>
+        </reportingOwnerRelationship>
+    </reportingOwner>
+
+    <nonDerivativeTable></nonDerivativeTable>
+
+    <derivativeTable>
+        <derivativeHolding>
+            <securityTitle>
+                <value>Restricted stock units</value>
+            </securityTitle>
+            <conversionOrExercisePrice>
+                <footnoteId id="F2"/>
+            </conversionOrExercisePrice>
+            <exerciseDate>
+                <footnoteId id="F1"/>
+            </exerciseDate>
+            <expirationDate>
+                <footnoteId id="F1"/>
+            </expirationDate>
+            <underlyingSecurity>
+                <underlyingSecurityTitle>
+                    <value>Common stock</value>
+                </underlyingSecurityTitle>
+                <underlyingSecurityShares>
+                    <value>263.0</value>
+                </underlyingSecurityShares>
+            </underlyingSecurity>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>D</value>
+                </directOrIndirectOwnership>
+            </ownershipNature>
+        </derivativeHolding>
+        <derivativeHolding>
+            <securityTitle>
+                <value>Performance share units</value>
+            </securityTitle>
+            <conversionOrExercisePrice>
+                <footnoteId id="F3"/>
+            </conversionOrExercisePrice>
+            <exerciseDate>
+                <footnoteId id="F3"/>
+            </exerciseDate>
+            <expirationDate>
+                <footnoteId id="F3"/>
+            </expirationDate>
+            <underlyingSecurity>
+                <underlyingSecurityTitle>
+                    <value>Common stock</value>
+                </underlyingSecurityTitle>
+                <underlyingSecurityShares>
+                    <value>262.0</value>
+                </underlyingSecurityShares>
+            </underlyingSecurity>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>D</value>
+                </directOrIndirectOwnership>
+            </ownershipNature>
+        </derivativeHolding>
+    </derivativeTable>
+
+    <footnotes>
+        <footnote id="F1">The restricted stock units will vest (i.e., the restrictions will lapse) in three equal installments beginning on May 22, 2020, provided the reporting person remains in continuing active service on the vesting date (subject to accelerated vesting in some circumstances).</footnote>
+        <footnote id="F2">The reporting person received a grant of 263 restricted stock units of Adams Resources &amp; Energy, Inc. (AE) on June 3, 2019.  Each restricted stock unit represents a contingent right to receive one share of AE common stock upon vesting.</footnote>
+        <footnote id="F3">The reporting person received a grant of 262 performance share units of Adams Resources &amp; Energy, Inc. on June 3, 2019. The performance share units will vest on May 22, 2022, provided the reporting person remains in continuing active service on the vesting date (subject to accelerated vesting in certain circumstances), and subject to the attainment of certain performance criteria as specified in the award agreement.</footnote>
+    </footnotes>
+
+    <remarks></remarks>
+
+    <ownerSignature>
+        <signatureName>/s/ Wade M. Harrison</signatureName>
+        <signatureDate>2020-01-21</signatureDate>
+    </ownerSignature>
+</ownershipDocument>
+</XML>
+</TEXT>
+</DOCUMENT>
+</SEC-DOCUMENT>
