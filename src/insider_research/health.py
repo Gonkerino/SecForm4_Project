@@ -20,6 +20,7 @@ from pathlib import Path
 from psycopg.types.json import Jsonb
 
 from .catalog import Catalog, utc_now
+from .coverage import SOURCE_COVERAGE_SQL, coverage_counts
 from .discovery import atomic_write
 from .http import FetchError, HttpClient
 from .locking import publisher_lock
@@ -153,11 +154,11 @@ ACTIVE = '''((h.stage='download' AND EXISTS(SELECT 1 FROM submissions s
              WHERE a.id=CASE WHEN h.stage='discover' THEN h.target::bigint END AND a.sha256=h.version)))'''
 
 
-def issues(cfg, *, stage=None, accession=None, limit=100, severity=None):
+def issues(cfg, *, stage=None, accession=None, limit=100, severity=None, include_covered=False):
     if not 1 <= limit <= 10000:
         raise ValueError('Limit must be between 1 and 10000')
     # UNION is evaluated on the server; counts remain complete even when output is limited.
-    query = f'''WITH items AS (
+    query = f'''WITH source_coverage AS ({SOURCE_COVERAGE_SQL}), items AS (
       SELECT h.stage,h.accession,h.target,'integrity' AS category,'error' AS severity,
              'repairable' AS action,h.messages::text AS message FROM health_receipts h
       WHERE NOT h.valid AND {ACTIVE}
@@ -177,18 +178,27 @@ def issues(cfg, *, stage=None, accession=None, limit=100, severity=None):
           AND q.source_sha256=p.source_sha256 AND q.parser_version=p.parser_version)
         AND NOT EXISTS(SELECT 1 FROM parse_results r WHERE r.accession=p.accession
           AND r.source_sha256=p.source_sha256 AND r.parser_version=p.parser_version)
-      UNION ALL SELECT 'discover',NULL,s.kind || ':' || s.period,'coverage','error','retryable',
-        coalesce(a.error,'Registered source has no completed discovery attempt') FROM sources s
-        LEFT JOIN LATERAL(SELECT * FROM attempts a WHERE a.source_id=s.id ORDER BY id DESC LIMIT 1) a ON TRUE
-        WHERE a.status IS DISTINCT FROM 'validated'
+      UNION ALL SELECT 'discover',NULL,kind || ':' || period,
+        CASE WHEN coverage_status='covered_by_quarter' THEN 'covered_by_quarter' ELSE 'coverage' END,
+        CASE WHEN coverage_status='covered_by_quarter' THEN 'info' ELSE 'error' END,
+        CASE WHEN coverage_status='covered_by_quarter' THEN 'none' ELSE 'retryable' END,
+        CASE WHEN coverage_status='covered_by_quarter' THEN
+          'Covered by quarterly index ' || covering_quarter || ' (artifact ' || covering_artifact_id ||
+          '); daily request remains ' || coalesce(latest_attempt_status,'not attempted') ||
+          '. Original daily-attempt error: ' || coalesce(error,'none (not attempted)')
+        ELSE coalesce(error,'Registered source has no completed discovery attempt') END
+        FROM source_coverage WHERE coverage_status!='validated'
     ) SELECT * FROM items WHERE (%s::text IS NULL OR stage=%s)
-        AND (%s::text IS NULL OR accession=%s) AND (%s::text IS NULL OR severity=%s)'''
-    params = [PARSER_VERSION, stage, stage, accession, accession, severity, severity]
+        AND (%s::text IS NULL OR accession=%s) AND (%s::text IS NULL OR severity=%s)
+        AND (%s OR category!='covered_by_quarter')'''
+    params = [PARSER_VERSION, stage, stage, accession, accession, severity, severity, include_covered]
     with Catalog(cfg) as cat, cat.connection.transaction():
         cat.connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+        covered = coverage_counts(cat)['covered_daily_sources'] if stage in (None, 'discover') and accession is None else 0
         total = cat.connection.execute('SELECT count(*) AS n FROM (' + query + ') q', params).fetchone()['n']
         rows = list(cat.connection.execute(query + ' ORDER BY stage,accession NULLS FIRST,target,category,message LIMIT %s', [*params, limit]))
-    return dict(total=total, shown=len(rows), issues=rows,
+    return dict(total=total, shown=len(rows), issues=rows, covered_daily_sources=covered,
+                covered_sources_included=include_covered,
                 next='Use repair for integrity findings; download/parse --retry-failed for failed attempts; discover for coverage gaps. Source review requires investigation.')
 
 
@@ -201,10 +211,10 @@ def status(cfg):
             max(h.checked_at) AS last_verified_at FROM health_receipts h
             WHERE h.valid AND {ACTIVE} GROUP BY h.stage ORDER BY h.stage'''))
         running = list(cat.connection.execute("SELECT id,command,started_at FROM runs WHERE status='running' ORDER BY started_at"))
-        gaps = sum(r['latest_attempt_status'] != 'validated' for r in cat.coverage())
+        coverage = coverage_counts(cat)
     pending_download = acquisition['total_indexed'] - acquisition['already_downloaded']
     pending_parse = extraction['downloaded'] - extraction['current_source_and_parser']
-    return dict(discovery=dict(indexed=acquisition['total_indexed'], unresolved_sources=gaps),
+    return dict(discovery=dict(indexed=acquisition['total_indexed'], **coverage),
                 downloads=dict(registered=extraction['downloaded'], pending=pending_download,
                                failed_latest=acquisition['latest_failed']), parsing=extraction,
                 verification=dict(receipts=verified, recent_checks=latest,

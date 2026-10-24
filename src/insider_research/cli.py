@@ -80,7 +80,8 @@ def parser():
             if name == 'repair':
                 cmd.add_argument('--dry-run', action='store_true')
             else:
-                cmd.add_argument('--severity', choices=('error', 'review', 'warning'))
+                cmd.add_argument('--severity', choices=('error', 'review', 'warning', 'info'))
+                cmd.add_argument('--include-covered', action='store_true', help='Also show unresolved daily requests covered by quarterly indexes')
         elif name == 'show':
             cmd.add_argument('accession')
             cmd.add_argument('--result-id', type=int)
@@ -188,7 +189,7 @@ def main(argv=None):
                     verification_observations=len(result['verification']), repair_attempts=len(result['repairs']),
                     next='Use show --details or --json for all fields, footnotes, signatures and history')
         elif args.command == 'issues':
-            result = health.issues(cfg, stage=args.stage, accession=accession, limit=limit, severity=args.severity)
+            result = health.issues(cfg, stage=args.stage, accession=accession, limit=limit, severity=args.severity, include_covered=args.include_covered)
         elif args.command == 'repair':
             with Progress('Repairing integrity', 'object') as progress:
                 result = health.repair(cfg, stage=args.stage, accession=accession, limit=limit,

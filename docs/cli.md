@@ -75,6 +75,24 @@ remain separate filings, and transactions are not multiplied by joint owners.
 
 ## Checking and repairing
 
+Discovery status distinguishes `unresolved_sources` (registered sources without
+confirmed alternative coverage), `covered_daily_sources` (unresolved daily
+requests covered by an active quarterly index), and `unresolved_source_requests`
+(the original request-level total). Counts describe registered sources, not an
+exhaustive audit of all possible SEC dates.
+
+`issues` omits covered daily requests by default. Use
+`insider issues --stage discover --include-covered` to include them as informational
+entries with the covering quarter/artifact and original error. Add `--severity info`
+to show only these entries. The request history is preserved.
+
+A quarterly index covers earlier dates evidenced by its latest indexed filing
+date; its final indexed date requires an online observation on a later New York
+day. A quarter fetched online after quarter-end covers the whole quarter, including
+days with no filings. Offline replay cannot advance that observation date. Only
+the active revision counts, and a recorded integrity failure disqualifies it until
+successfully rechecked/repaired. This does not certify submission downloads.
+
 ```powershell
 insider check
 insider issues

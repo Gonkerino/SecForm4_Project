@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from insider_research import health
 from insider_research.catalog import Catalog
+from insider_research.coverage import coverage_counts
 from insider_research.cli import main, parser
 from insider_research.discovery import discover
 from insider_research.http import Response, FetchError
@@ -72,6 +73,68 @@ class HealthTests(unittest.TestCase):
         checked = health.check(self.cfg, stage='download')
         self.assertEqual((checked['status'], checked['checked']), ('valid', 1))
         self.assertEqual(health.status(self.cfg)['verification']['receipts'][0]['verified_objects'], 1)
+
+    def test_quarterly_coverage_separates_failed_requests_from_gaps(self):
+        self.index()
+        with Catalog(self.cfg) as cat:
+            cat.register_sources([source_for('daily', day) for day in ('2020-01-01','2020-01-02','2020-01-03')])
+            cat.connection.execute("UPDATE attempts SET finished_at='2020-01-03 12:00:00+00'")
+            counts = coverage_counts(cat)
+        self.assertEqual(counts['unresolved_sources'], 1)
+        self.assertEqual(counts['covered_daily_sources'], 2)
+        self.assertEqual(counts['unresolved_source_requests'], 3)
+        result = health.issues(self.cfg, stage='discover')
+        self.assertEqual(result['total'], 1)
+        self.assertEqual(result['issues'][0]['target'], 'daily:2020-01-03')
+        included = health.issues(self.cfg, stage='discover', include_covered=True)
+        self.assertEqual(included['total'], 3)
+        covered = [r for r in included['issues'] if r['category']=='covered_by_quarter']
+        self.assertEqual(len(covered), 2)
+        self.assertTrue(all(r['severity']=='info' and r['action']=='none' for r in covered))
+        self.assertEqual(health.status(self.cfg)['discovery']['unresolved_sources'], 1)
+        with Catalog(self.cfg) as cat:
+            self.assertEqual(sum(r['latest_attempt_status'] is None for r in cat.coverage()), 3)
+
+    def test_offline_replay_cannot_extend_quarterly_coverage(self):
+        self.index()
+        with Catalog(self.cfg) as cat:
+            cat.register_sources([source_for('daily','2020-01-03')])
+            cat.connection.execute("UPDATE attempts SET finished_at='2020-01-03 12:00:00+00'")
+        discover(self.cfg, [source_for('quarterly','2020Q1')], offline=True)
+        with Catalog(self.cfg) as cat:
+            self.assertEqual(coverage_counts(cat)['unresolved_sources'], 1)
+            cat.connection.execute("UPDATE attempts SET finished_at='2020-04-01 12:00:00+00' WHERE response_json->>'offline' IS DISTINCT FROM 'true'")
+            self.assertEqual(coverage_counts(cat)['covered_daily_sources'], 1)
+
+    def test_failed_daily_history_and_new_york_day_boundary(self):
+        self.index()
+        with Catalog(self.cfg) as cat:
+            run = cat.start_run('fixture', self.cfg)
+            day = source_for('daily','2020-01-02')
+            _, attempt = cat.begin_attempt(run,day.kind,day.period,day.url)
+            cat.fail_attempt(attempt,'SEC returned HTTP 403',http_status=403)
+            cat.finish_run(run,'incomplete',{})
+            cat.connection.execute("UPDATE attempts SET finished_at='2020-01-03 02:00:00+00' WHERE status='validated'")
+            self.assertEqual(coverage_counts(cat)['unresolved_sources'], 1)
+            cat.connection.execute("UPDATE attempts SET finished_at='2020-01-03 06:00:00+00' WHERE status='validated'")
+            self.assertEqual(coverage_counts(cat)['covered_daily_sources'], 1)
+            self.assertEqual(cat.connection.execute('SELECT status FROM attempts WHERE id=%s',(attempt,)).fetchone()['status'],'failed')
+        issue = health.issues(self.cfg,stage='discover',include_covered=True)['issues'][0]
+        self.assertIn('HTTP 403',issue['message'])
+
+    def test_damaged_or_unselected_quarter_does_not_hide_daily_gap(self):
+        self.index()
+        with Catalog(self.cfg) as cat:
+            cat.register_sources([source_for('daily','2020-01-01')])
+            path = self.cfg.data_root / cat.connection.execute('SELECT relative_path FROM artifacts').fetchone()['relative_path']
+        path.write_bytes(b'corrupt')
+        health.check(self.cfg, stage='discover')
+        result = health.issues(self.cfg, stage='discover')
+        self.assertEqual({r['category'] for r in result['issues']}, {'coverage','integrity'})
+        self.assertEqual(result['covered_daily_sources'], 0)
+        with Catalog(self.cfg) as cat:
+            cat.connection.execute('UPDATE sources SET current_artifact_id=NULL')
+            self.assertEqual(coverage_counts(cat)['covered_daily_sources'], 0)
 
     def test_download_repair_restores_snapshot_and_preserves_failed_observation(self):
         path = self.seed()
