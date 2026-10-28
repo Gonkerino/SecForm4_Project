@@ -33,9 +33,13 @@ July 2003 and records no longer present in active index revisions. `--start`,
 omitting it processes all eligible records at the start of the locked run.
 
 Discovery, downloads and parsing currently share the publisher lock. Only one
-cooperating writer runs at a time. The parser uses bounded keyset pages and one
-submission at a time. A batch may be interrupted with Ctrl+C; committed results
-survive and the interrupted attempt is retryable. After a hard process crash,
+cooperating writer runs at a time. The parser uses bounded keyset pages, four
+preparation threads by default (`--workers 1..20`), and bulk database publication.
+Preparation overlaps publication of the preceding group; at most two groups of
+32 filings/8 MiB recorded source text are queued (a larger filing forms a
+one-filing group). Each group's typed data, evidence, selected results and attempt receipts
+commit together. A batch may be interrupted with Ctrl+C; committed groups
+survive and unfinished attempts are retryable. After a hard process crash,
 `insider recover` marks abandoned running attempts/runs interrupted under the lock.
 
 ```powershell

@@ -8,6 +8,7 @@ from pathlib import Path
 import uuid
 import zipfile
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 from psycopg import sql
 from psycopg.types.json import Jsonb
@@ -25,6 +26,9 @@ TABLES = {
     "issues": "parse_issues",
 }
 JSON_COLUMNS = {"attributes", "counts_json"}
+PARSE_BATCH_SIZE = 32
+PARSE_BATCH_BYTES = 8 * 1024 * 1024
+CONTENT_ERRORS = (ValueError, OSError, zipfile.BadZipFile, EOFError, RuntimeError, zlib.error)
 
 
 def _safe_path(root, relative):
@@ -40,8 +44,16 @@ def read_archive(cfg, row, *, snapshot=False):
     path = _safe_path(cfg.data_root, relative)
     maximum = min(cfg.max_submission_bytes, 128 * 1024 * 1024)
     with path.open("rb") as stream:
-        archive_bytes = stream.read(maximum * 2 + 1024 * 1024 + 1)
-    if len(archive_bytes) > maximum * 2 + 1024 * 1024:
+        archive_limit = maximum * 2 + 1024 * 1024
+        archive_size = os.fstat(stream.fileno()).st_size
+        if archive_size > archive_limit:
+            raise ValueError("ZIP exceeds bounded archive size")
+        # A limit-sized read reserves a huge buffer even for a tiny ZIP on
+        # Windows. Size the read to this file, retaining a byte to detect growth.
+        archive_bytes = stream.read(archive_size + 1)
+    if len(archive_bytes) != archive_size:
+        raise ValueError("ZIP changed size while being read")
+    if len(archive_bytes) > archive_limit:
         raise ValueError("ZIP exceeds bounded archive size")
     expected_hash = row["source_sha256"] if snapshot else row["sha256"]
     if hashlib.sha256(archive_bytes).hexdigest() != expected_hash:
@@ -94,7 +106,15 @@ def _insert(connection, table, rows):
         sql.Identifier(table), sql.SQL(",").join(map(sql.Identifier, keys)),
         sql.SQL(",").join(sql.Placeholder() for _ in keys))
     with connection.cursor() as cursor:
-        cursor.executemany(query, [[Jsonb(row[k]) if k in JSON_COLUMNS else row[k] for k in keys] for row in rows])
+        values = ([Jsonb(row[k]) if k in JSON_COLUMNS else row[k] for k in keys] for row in rows)
+        if len(rows) < 8:
+            cursor.executemany(query, values)
+        else:
+            copy = sql.SQL("COPY {} ({}) FROM STDIN").format(
+                sql.Identifier(table), sql.SQL(",").join(map(sql.Identifier, keys)))
+            with cursor.copy(copy) as writer:
+                for values_row in values:
+                    writer.write_row(values_row)
 
 
 def _counts(extracted):
@@ -128,20 +148,90 @@ def publish(catalog, row, attempt_id, extracted, snapshot_path, source_hash):
     return result_id
 
 
-def _selection(start=None, end=None, form=None, accession=None):
+def _prepare(cfg, row):
+    """Workers touch source files only; PostgreSQL stays on the coordinator."""
+    prepared = dict(row=row, snapshot_path=None, source_hash=None, extracted=None, message=None)
+    try:
+        body, archive_bytes = read_archive(cfg, row)
+        prepared['snapshot_path'] = _snapshot(cfg, row['sha256'], archive_bytes)
+        prepared['source_hash'] = hashlib.sha256(body).hexdigest()
+        prepared['extracted'] = parse_submission(body, row['accession'])
+    except CONTENT_ERRORS as exc:
+        prepared['status'] = 'unsupported' if isinstance(exc, UnsupportedSubmission) else 'failed'
+        prepared['message'] = str(exc)[:2000]
+    return prepared
+
+
+def _publish_batch(catalog, prepared):
+    """Publish a bounded group atomically, retaining every per-filing receipt."""
+    connection = catalog.connection
+    successful = [p for p in prepared if p['extracted'] is not None]
+    with connection.transaction():
+        if successful:
+            metadata = [dict(accession=p['row']['accession'], attempt_id=p['attempt_id'],
+                source_sha256=p['row']['sha256'], source_text_sha256=p['source_hash'],
+                source_snapshot_path=p['snapshot_path'], status=p['status'],
+                counts_json=_counts(p['extracted'])) for p in successful]
+            result_ids = {r['accession']: r['id'] for r in connection.execute('''INSERT INTO parse_results
+                (accession,attempt_id,source_sha256,source_text_sha256,source_snapshot_path,
+                 parser_version,parsed_at,status,counts_json)
+                SELECT accession,attempt_id,source_sha256,source_text_sha256,source_snapshot_path,
+                       %s,now(),status,counts_json
+                FROM jsonb_to_recordset(%s) AS t(accession text,attempt_id bigint,
+                    source_sha256 text,source_text_sha256 text,source_snapshot_path text,
+                    status text,counts_json jsonb) RETURNING accession,id''', (PARSER_VERSION, Jsonb(metadata)))}
+            tables = {'submission_headers': [], 'submission_documents': [], 'ownership_reports': [],
+                      **{table: [] for table in TABLES.values()}}
+            for p in successful:
+                result_id = result_ids[p['row']['accession']]
+                extracted = p['extracted']
+                tables['submission_headers'].append(dict(result_id=result_id, **extracted.header))
+                tables['ownership_reports'].append(dict(result_id=result_id, **extracted.report))
+                for name, table in TABLES.items():
+                    for number, row in enumerate(getattr(extracted, name), 1):
+                        values = dict(result_id=result_id, **row)
+                        if name == 'issues':
+                            values['issue_number'] = number
+                        tables[table].append(values)
+            # Header/document/report order satisfies the ownership foreign keys.
+            for table, rows in tables.items():
+                _insert(connection, table, rows)
+            connection.execute('''INSERT INTO ownership_current_results
+                SELECT accession,id FROM parse_results WHERE id=ANY(%s)
+                ON CONFLICT(accession) DO UPDATE SET result_id=excluded.result_id''', (list(result_ids.values()),))
+        receipts = [dict(id=p['attempt_id'], status=p['status'], error=p['message'],
+                         path=p['snapshot_path'], digest=p['source_hash']) for p in prepared]
+        connection.execute('''UPDATE parse_attempts p SET status=t.status,finished_at=now(),
+            error=t.error,source_snapshot_path=t.path,source_text_sha256=t.digest
+            FROM jsonb_to_recordset(%s) AS t(id bigint,status text,error text,path text,digest text)
+            WHERE p.id=t.id''', (Jsonb(receipts),))
+
+
+def _selection(start=None, end=None, form=None, accession=None, *, accession_after=None):
     if start and end and start > end:
         raise ValueError("Start date must be on or before end date")
     parts, params = [], []
     if accession:
         parts.append("s.accession=%s")
         params.append(accession)
+    if accession_after is not None:
+        parts.append("s.accession>%s")
+        params.append(accession_after)
     association_parts = ["a.accession=s.accession"]
+    association_params = []
+    if accession_after is not None:
+        # PostgreSQL need not propagate the outer keyset bound through a semi
+        # merge join. Without this explicit inner bound, every later page can
+        # scan all earlier associations again.
+        association_parts.append("a.accession>%s")
+        association_params.append(accession_after)
     for expression, value in (("a.filed_date >= %s", start), ("a.filed_date <= %s", end), ("a.form_type=%s", form)):
         if value is not None:
             association_parts.append(expression)
-            params.append(value)
+            association_params.append(value)
     if start is not None or end is not None or form is not None:
         parts.append("EXISTS(SELECT 1 FROM associations a WHERE " + " AND ".join(association_parts) + ")")
+        params.extend(association_params)
     return " AND ".join(parts) if parts else "TRUE", params
 
 
@@ -169,9 +259,11 @@ def plan_parse(cfg, *, retry_failed=False, **filters):
                 note="Local archives only. Date/form filters use historical index observations. No default date cutoff.")
 
 
-def parse_ownership(cfg, *, limit=None, retry_failed=False, progress=None, **filters):
+def parse_ownership(cfg, *, limit=None, retry_failed=False, progress=None, workers=4, **filters):
     if limit is not None and not 1 <= limit <= 10000:
         raise ValueError("Limit must be between 1 and 10000")
+    if not 1 <= workers <= 20:
+        raise ValueError("Workers must be between 1 and 20")
     where, params = _selection(**filters)
     eligible, versions = _eligibility(retry_failed)
     summary = dict(parser_version=PARSER_VERSION, processed=0, complete=0, complete_with_warnings=0,
@@ -187,52 +279,80 @@ def parse_ownership(cfg, *, limit=None, retry_failed=False, progress=None, **fil
         run_id = catalog.start_run("parse-ownership", cfg)
         summary["run_id"] = run_id
         after = ""
-        try:
-            while summary["processed"] < total:
-                rows = list(catalog.connection.execute(f"""SELECT s.* FROM submissions s
-                    WHERE {where} AND {eligible} AND s.accession>%s ORDER BY s.accession LIMIT %s""",
-                    [*params, *versions, after, min(100, total - summary["processed"])]))
-                if not rows:
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='ownership') if workers > 1 else None
+        scheduled = 0
+
+        def enqueue():
+            nonlocal after, scheduled
+            if scheduled >= total:
+                return None
+            page_where, page_params = _selection(**filters, accession_after=after)
+            rows = list(catalog.connection.execute(f"""SELECT s.* FROM submissions s
+                WHERE {page_where} AND {eligible} ORDER BY s.accession LIMIT %s""",
+                [*page_params, *versions, min(PARSE_BATCH_SIZE, total - scheduled)]))
+            if not rows:
+                return None
+            group, source_bytes = [], 0
+            for row in rows:
+                if group and source_bytes + row['source_bytes'] > PARSE_BATCH_BYTES:
                     break
-                for row in rows:
-                    after = row["accession"]
-                    attempt = catalog.connection.execute("""INSERT INTO parse_attempts
-                        (run_id,accession,source_sha256,parser_version,started_at,status)
-                        VALUES(%s,%s,%s,%s,%s,'running') RETURNING id""",
-                        (run_id, after, row["sha256"], PARSER_VERSION, utc_now())).fetchone()["id"]
-                    message = None
-                    try:
-                        body, archive_bytes = read_archive(cfg, row)
-                        snapshot_path = _snapshot(cfg, row["sha256"], archive_bytes)
-                        source_hash = hashlib.sha256(body).hexdigest()
-                        catalog.connection.execute("UPDATE parse_attempts SET source_snapshot_path=%s,source_text_sha256=%s WHERE id=%s",
-                                                   (snapshot_path, source_hash, attempt))
-                        extracted = parse_submission(body, after)
-                        observations = list(catalog.connection.execute("SELECT DISTINCT form_type,filed_date FROM current_associations WHERE accession=%s", (after,)))
-                        if any(o["form_type"] != extracted.report["form_type"] or o["filed_date"] != extracted.header["filed_date"] for o in observations):
-                            extracted.issue("index_document_mismatch", "SEC-HEADER", "Current index form/date differs from submission")
-                        publish(catalog, row, attempt, extracted, snapshot_path, source_hash)
-                        status = extracted.status
-                    except (ValueError, OSError, zipfile.BadZipFile, EOFError, RuntimeError, zlib.error) as exc:
-                        status = "unsupported" if isinstance(exc, UnsupportedSubmission) else "failed"
-                        message = str(exc)[:2000]
-                        catalog.connection.execute("UPDATE parse_attempts SET status=%s,finished_at=%s,error=%s WHERE id=%s",
-                                                   (status, utc_now(), message, attempt))
-                        # Detailed failures are retained in the DB; keep CLI output bounded.
-                        if len(summary["errors"]) < 100:
-                            summary["errors"].append(dict(accession=after, status=status, message=message))
-                    summary[status] += 1
-                    summary["processed"] += 1
-                    if progress:
-                        progress(dict(event="progress", current=summary["processed"], accession=after,
-                                      status="failed" if status in ("unsupported", "failed") else status,
-                                      message=message, problems=summary["needs_review"] + summary["unsupported"] + summary["failed"]))
+                group.append(row)
+                source_bytes += row['source_bytes']
+            after = group[-1]['accession']
+            identities = [dict(accession=r['accession'], digest=r['sha256']) for r in group]
+            attempts = {r['accession']: r['id'] for r in catalog.connection.execute('''INSERT INTO parse_attempts
+                (run_id,accession,source_sha256,parser_version,started_at,status)
+                SELECT %s,accession,digest,%s,now(),'running'
+                FROM jsonb_to_recordset(%s) AS t(accession text,digest text) RETURNING accession,id''',
+                (run_id, PARSER_VERSION, Jsonb(identities)))}
+            observations = {}
+            for observation in catalog.connection.execute('''SELECT DISTINCT accession,form_type,filed_date
+                    FROM current_associations WHERE accession=ANY(%s)''', (list(attempts),)):
+                observations.setdefault(observation['accession'], []).append(observation)
+            futures = [pool.submit(_prepare, cfg, row) for row in group] if pool else None
+            scheduled += len(group)
+            return group, attempts, observations, futures
+
+        try:
+            pending = enqueue()
+            while pending is not None:
+                group, attempts, observations, futures = pending
+                prepared = ([future.result() for future in futures] if futures is not None else
+                            [_prepare(cfg, row) for row in group])
+                for p in prepared:
+                    accession = p['row']['accession']
+                    p['attempt_id'] = attempts[accession]
+                    extracted = p['extracted']
+                    if extracted is not None:
+                        if any(o['form_type'] != extracted.report['form_type'] or o['filed_date'] != extracted.header['filed_date']
+                               for o in observations.get(accession, ())):
+                            extracted.issue('index_document_mismatch', 'SEC-HEADER', 'Current index form/date differs from submission')
+                        p['status'] = extracted.status
+                # Overlap preparation of the next bounded group with COPY and
+                # commit of this one. Never queue the entire catalogue.
+                pending = enqueue()
+                _publish_batch(catalog, prepared)
+                # Account for the entire committed group before callbacks, which
+                # may interrupt the command after its first progress event.
+                for p in prepared:
+                    summary[p['status']] += 1
+                    if p['message'] is not None and len(summary['errors']) < 100:
+                        summary['errors'].append(dict(accession=p['row']['accession'], status=p['status'], message=p['message']))
+                summary['processed'] += len(prepared)
+                for p in prepared:
+                    if progress and (p is prepared[-1] or p['status'] in ('unsupported', 'failed')):
+                        progress(dict(event='progress', current=summary['processed'], accession=p['row']['accession'],
+                                      status='failed' if p['status'] in ('unsupported', 'failed') else p['status'],
+                                      message=p['message'], problems=summary['needs_review'] + summary['unsupported'] + summary['failed']))
         except BaseException as exc:
             catalog.connection.execute("UPDATE parse_attempts SET status='interrupted',finished_at=%s,error=%s WHERE run_id=%s AND status='running'",
                                        (utc_now(), "Parser run interrupted", run_id))
             catalog.finish_run(run_id, "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", summary,
                                "Parser run interrupted" if isinstance(exc, KeyboardInterrupt) else "Parser run failed; see attempt records")
             raise
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
         summary["unattempted_eligible"] = eligible_count - summary["processed"]
         summary["status"] = "incomplete" if summary["failed"] or summary["unsupported"] or summary["needs_review"] else "succeeded"
         catalog.finish_run(run_id, summary["status"], summary)

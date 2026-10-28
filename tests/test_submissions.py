@@ -173,6 +173,16 @@ class SubmissionTests(unittest.TestCase):
 
 
 class ZipVerificationTests(unittest.TestCase):
+    def test_configured_bounds_reject_large_source_and_archive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'test.zip'
+            for compression in (zipfile.ZIP_DEFLATED, zipfile.ZIP_STORED):
+                with self.subTest(compression=compression):
+                    with zipfile.ZipFile(path, 'w', compression=compression) as archive:
+                        archive.writestr('accession.txt', b'a' * (2 * 1024 * 1024))
+                    with self.assertRaisesRegex(ValueError, 'exceeds'):
+                        _verify_zip(path, 'accession', max_source_bytes=1024)
+
     def test_small_and_large_archives_retain_all_checks(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "test.zip"

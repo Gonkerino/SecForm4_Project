@@ -19,33 +19,45 @@ from .locking import publisher_lock
 from .sources.indexes import ACCESSION
 
 
-def _verify_zip(path: Path, accession: str, source_sha256: str | None = None) -> tuple[str, int, int]:
+def _verify_zip(path: Path, accession: str, source_sha256: str | None = None,
+                *, max_source_bytes: int | None = None) -> tuple[str, int, int]:
     # Small archives are read once from disk. Large ones retain bounded-memory
     # streaming; hashing and ZIP checks use the same open file descriptor.
     with path.open("rb") as stream:
         zip_size = os.fstat(stream.fileno()).st_size
+        if max_source_bytes is not None and zip_size > max_source_bytes * 2 + 1024 * 1024:
+            raise ValueError("ZIP exceeds bounded archive size")
         if zip_size <= 8 * 1024 * 1024:
-            body = stream.read()
+            body = stream.read(zip_size + 1)
+            if len(body) != zip_size:
+                raise ValueError("ZIP changed size while being read")
             digest = hashlib.sha256(body).hexdigest()
-            return _verify_zip_contents(io.BytesIO(body), accession, source_sha256, digest, zip_size)
+            return _verify_zip_contents(io.BytesIO(body), accession, source_sha256, digest, zip_size,
+                                        max_source_bytes=max_source_bytes)
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
         stream.seek(0)
-        return _verify_zip_contents(stream, accession, source_sha256, digest, zip_size)
+        return _verify_zip_contents(stream, accession, source_sha256, digest, zip_size,
+                                    max_source_bytes=max_source_bytes)
 
 
-def _verify_zip_contents(stream, accession, source_sha256, digest, zip_size):
+def _verify_zip_contents(stream, accession, source_sha256, digest, zip_size, *, max_source_bytes=None):
     with zipfile.ZipFile(stream) as archive:
         names = archive.namelist()
         expected = f"{accession}.txt"
         if names != [expected]:
             raise ValueError("Submission ZIP has an unexpected file list")
+        info = archive.infolist()[0]
+        if max_source_bytes is not None and info.file_size > max_source_bytes:
+            raise ValueError("Submission exceeds configured extraction size")
         source_hash = hashlib.sha256() if source_sha256 is not None else None
         source_size = 0
         with archive.open(expected) as source:
-            while chunk := source.read(1024 * 1024):
+            while chunk := source.read(min(1024 * 1024, info.file_size + 1)):
                 if source_hash is not None:
                     source_hash.update(chunk)
                 source_size += len(chunk)
+                if max_source_bytes is not None and source_size > max_source_bytes:
+                    raise ValueError("Decompressed submission exceeds configured extraction size")
         if source_size == 0:
             raise ValueError("Submission file is empty")
         if source_hash is not None and source_hash.hexdigest() != source_sha256:
@@ -84,12 +96,12 @@ def _publish_zip(cfg: Config, accession: str, body: bytes) -> tuple[str, str, in
     return zip_hash, relative.as_posix(), zip_size, source_size
 
 
-def _verify_registered_submission(root, row):
+def _verify_registered_submission(root, row, *, max_source_bytes=None):
     try:
         path = (root / row["archive_path"]).resolve()
         if not path.is_relative_to(root):
             raise ValueError("Submission archive path escapes data root")
-        digest, zip_size, source_size = _verify_zip(path, row["accession"])
+        digest, zip_size, source_size = _verify_zip(path, row["accession"], max_source_bytes=max_source_bytes)
         if (digest != row["sha256"] or zip_size != row["zip_bytes"]
                 or source_size != row["source_bytes"]):
             raise ValueError("ZIP checksum or recorded length mismatch")

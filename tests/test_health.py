@@ -4,6 +4,9 @@ import io
 import json
 import tempfile
 import unittest
+import psycopg
+import subprocess
+import sys
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
@@ -19,7 +22,7 @@ from insider_research.ownership_store import parse_ownership, inspect_ownership
 from insider_research.sources.indexes import source_for
 from insider_research.submissions import _publish_zip, download_submissions
 from tests.helpers import postgres_config, HEADER, record
-from tests.test_ownership import FORM4, FORM5, source
+from tests.test_ownership import FORM3, FORM4, FORM5, source
 
 
 class InterfaceTests(unittest.TestCase):
@@ -29,6 +32,17 @@ class InterfaceTests(unittest.TestCase):
         self.assertNotIn('parse-ownership', help_text)
         self.assertEqual(parser().parse_args(['parse-ownership', '--limit', '1']).limit, 1)
         self.assertEqual(parser().parse_args(['download', '--dry-run']).start, None)
+        self.assertEqual(parser().parse_args(['check', '--workers', '8']).workers, 8)
+        self.assertEqual(parser().parse_args(['check']).workers, 8)
+        self.assertEqual(parser().parse_args(['check']).executor, 'auto')
+        self.assertEqual(parser().parse_args(['check', '--executor', 'process']).executor, 'process')
+
+    def test_check_rejects_worker_count_before_opening_database(self):
+        for workers in (0, 21):
+            with self.subTest(workers=workers), self.assertRaisesRegex(ValueError, 'Workers'):
+                health.check(None, workers=workers)
+        with self.assertRaisesRegex(ValueError, 'Executor'):
+            health.check(None, executor='invalid')
 
     def test_discovery_preview_needs_no_database(self):
         output = io.StringIO()
@@ -73,6 +87,33 @@ class HealthTests(unittest.TestCase):
         checked = health.check(self.cfg, stage='download')
         self.assertEqual((checked['status'], checked['checked']), ('valid', 1))
         self.assertEqual(health.status(self.cfg)['verification']['receipts'][0]['verified_objects'], 1)
+
+    def test_filtered_keyset_pages_preserve_dates_forms_identity_and_deduplication(self):
+        client = unittest.mock.Mock()
+        client.get.return_value = Response(HEADER + record(accession=FORM3, form='3', filed='2015-01-02'), {})
+        discover(self.cfg, [source_for('quarterly', '2015Q1')], client=client)
+        client.get.return_value = Response(HEADER +
+            record(accession=FORM4, form='4', filed='2020-01-02') +
+            record(accession=FORM4, form='4', filed='2020-01-02', cik='456') +
+            record(accession=FORM5, form='5', filed='2020-01-03'), {})
+        discover(self.cfg, [source_for('quarterly', '2020Q1')], client=client)
+        for accession in (FORM3, FORM4, FORM5):
+            self.seed(accession, parse=False)
+        cases = [({}, sorted((FORM3, FORM4, FORM5))),
+            (dict(start=date(2016,1,1)), sorted((FORM4, FORM5))),
+            (dict(start=date(2016,1,1), end=date(2020,1,2)), [FORM4]),
+            (dict(start=date(2016,1,1), form='5'), [FORM5]),
+            (dict(start=date(2016,1,1), accession=FORM4, form='4'), [FORM4]),
+            (dict(start=date(2016,1,1), accession=FORM3), []),
+            (dict(end=date(2015,12,31), form='3'), [FORM3]),
+            (dict(start=date(2030,1,1)), [])]
+        with Catalog(self.cfg) as cat, patch.object(health, 'CHECK_PAGE_SIZE', 1):
+            for filters, expected in cases:
+                with self.subTest(filters=filters):
+                    rows = list(health.targets(cat, 'download', **filters))
+                    self.assertEqual([r['accession'] for r in rows], expected)
+                    self.assertEqual(health.targets(cat, 'download', count_only=True, **filters), len(expected))
+                    self.assertTrue(all(set(r) == {'accession','archive_path','sha256','zip_bytes','source_bytes'} for r in rows))
 
     def test_quarterly_coverage_separates_failed_requests_from_gaps(self):
         self.index()
@@ -288,6 +329,155 @@ class HealthTests(unittest.TestCase):
         with Catalog(self.cfg) as cat:
             self.assertEqual(cat.connection.execute('SELECT status FROM health_checks').fetchone()['status'], 'interrupted')
             self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM health_receipts').fetchone()['n'], 1)
+
+    def test_parallel_check_batches_preserve_all_findings_and_history(self):
+        paths = {a: self.seed(a, parse=False) for a in (FORM3, FORM4, FORM5)}
+        paths[FORM3].unlink()
+        with Catalog(self.cfg) as cat:
+            cat.connection.execute('UPDATE submissions SET source_bytes=source_bytes+1 WHERE accession=%s', (FORM4,))
+        outcomes = []
+        with patch.object(health, 'CHECK_BATCH_SIZE', 2):
+            for workers in (1, 4):
+                events = []
+                result = health.check(self.cfg, stage='download', workers=workers, progress=events.append)
+                self.assertEqual((result['status'], result['checked'], result['problems']), ('invalid', 3, 2))
+                self.assertEqual(events[-1]['current'], 3)
+                with Catalog(self.cfg) as cat:
+                    outcomes.append({r['accession']: (r['valid'], r['messages']) for r in
+                        cat.connection.execute('SELECT * FROM health_observations WHERE check_id=%s', (result['check_id'],))})
+        self.assertEqual(outcomes[0], outcomes[1])
+        with Catalog(self.cfg) as cat:
+            self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM health_observations').fetchone()['n'], 6)
+            self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM health_receipts').fetchone()['n'], 3)
+            self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM health_receipts WHERE check_id=%s',
+                (result['check_id'],)).fetchone()['n'], 3)
+
+    def test_process_workers_match_serial_findings_and_keep_per_file_receipts(self):
+        paths = {a: self.seed(a, parse=False) for a in (FORM3, FORM4, FORM5)}
+        paths[FORM3].unlink()
+        with Catalog(self.cfg) as cat:
+            cat.connection.execute('UPDATE submissions SET source_bytes=source_bytes+1 WHERE accession=%s', (FORM5,))
+        outcomes = []
+        with patch.object(health, 'CHECK_PROCESS_CHUNK', 1):
+            for executor, workers in (('thread', 1), ('process', 2)):
+                result = health.check(self.cfg, stage='download', executor=executor, workers=workers)
+                self.assertEqual((result['checked'], result['problems'], result['status']), (3, 2, 'invalid'))
+                with Catalog(self.cfg) as cat:
+                    outcomes.append({r['accession']: (r['valid'], r['messages']) for r in
+                        cat.connection.execute('SELECT * FROM health_observations WHERE check_id=%s', (result['check_id'],))})
+        self.assertEqual(outcomes[0], outcomes[1])
+
+    def test_group_source_budget_keeps_every_target_without_duplication(self):
+        for accession in (FORM3, FORM4, FORM5):
+            self.seed(accession, parse=False)
+        with Catalog(self.cfg) as cat:
+            rows = list(health.targets(cat, 'download'))
+        sizes = []
+        original = health._verify_download_group
+        def measured(cfg, group):
+            sizes.append(len(group))
+            return original(cfg, group)
+        with patch.object(health, 'CHECK_GROUP_BYTES', 1), patch.object(health, '_verify_download_group', side_effect=measured):
+            results = list(health._download_checks(self.cfg, rows, 2))
+        self.assertEqual(sorted(r['accession'] for r, _ in results), sorted((FORM3, FORM4, FORM5)))
+        self.assertEqual(sizes, [1, 1, 1])
+        self.assertTrue(all(not messages for _, messages in results))
+
+    def test_auto_executor_and_single_worker_fallback(self):
+        self.seed(parse=False)
+        with patch.object(health, 'ProcessPoolExecutor', side_effect=AssertionError('unexpected process')):
+            result = health.check(self.cfg, stage='download', executor='auto', workers=2)
+            self.assertEqual(result['download_executor'], 'thread')
+            result = health.check(self.cfg, stage='download', executor='process', workers=1)
+            self.assertEqual(result['download_executor'], 'thread')
+        with patch.object(health, 'CHECK_PROCESS_THRESHOLD', 1):
+            result = health.check(self.cfg, stage='download', executor='auto', workers=2)
+        self.assertEqual((result['download_executor'], result['checked']), ('process', 1))
+
+    def test_process_interruption_preserves_only_committed_outcomes(self):
+        for accession in (FORM3, FORM4, FORM5):
+            self.seed(accession, parse=False)
+        def progress(event):
+            if event['event'] == 'progress':
+                raise KeyboardInterrupt()
+        with patch.object(health, 'CHECK_BATCH_SIZE', 2), patch.object(health, 'CHECK_PROCESS_CHUNK', 1), self.assertRaises(KeyboardInterrupt):
+            health.check(self.cfg, stage='download', executor='process', workers=2, progress=progress)
+        with Catalog(self.cfg) as cat:
+            result = cat.connection.execute('SELECT * FROM health_checks').fetchone()
+            self.assertEqual((result['status'], result['checked']), ('interrupted', 2))
+            self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM health_receipts').fetchone()['n'], 2)
+
+    def test_python_module_entry_point_runs_process_workers(self):
+        self.seed(parse=False)
+        commands = [[sys.executable, '-m', 'insider_research']]
+        installed = Path(sys.executable).with_name('insider.exe')
+        if installed.is_file():
+            commands.append([str(installed)])
+        for command in commands:
+            with self.subTest(command=command):
+                completed = subprocess.run([*command, '--data-root', str(self.cfg.data_root),
+                    'check', '--stage', 'download', '--executor', 'process', '--workers', '2', '--json'],
+                    capture_output=True, text=True, timeout=60)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                result = json.loads(completed.stdout)
+                self.assertEqual((result['download_executor'], result['checked'], result['problems']), ('process', 1, 0))
+
+    def test_interruption_counts_only_committed_batches(self):
+        for accession in (FORM3, FORM4, FORM5):
+            self.seed(accession, parse=False)
+        def progress(event):
+            if event['event'] == 'progress':
+                raise KeyboardInterrupt()
+        with patch.object(health, 'CHECK_BATCH_SIZE', 2), self.assertRaises(KeyboardInterrupt):
+            health.check(self.cfg, stage='download', workers=4, progress=progress)
+        with Catalog(self.cfg) as cat:
+            result = cat.connection.execute('SELECT * FROM health_checks').fetchone()
+            self.assertEqual((result['status'], result['checked']), ('interrupted', 2))
+            self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM health_receipts').fetchone()['n'], 2)
+            self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM health_observations').fetchone()['n'], 2)
+
+    def test_running_check_counters_match_committed_receipts(self):
+        for accession in (FORM3, FORM4, FORM5):
+            self.seed(accession, parse=False)
+        seen = []
+        def progress(event):
+            if event['event'] == 'progress':
+                with Catalog(self.cfg) as cat:
+                    check = cat.connection.execute('SELECT * FROM health_checks ORDER BY id DESC LIMIT 1').fetchone()
+                    observations = cat.connection.execute('SELECT count(*) AS n FROM health_observations WHERE check_id=%s',
+                        (check['id'],)).fetchone()['n']
+                self.assertEqual(check['status'], 'running')
+                self.assertEqual(check['checked'], observations)
+                self.assertEqual(check['checked'], event['current'])
+                seen.append(check['checked'])
+        with patch.object(health, 'CHECK_BATCH_SIZE', 2):
+            health.check(self.cfg, stage='download', progress=progress)
+        self.assertEqual(seen, [2, 3])
+
+    def test_interrupt_after_database_commit_keeps_durable_counters(self):
+        self.seed(parse=False)
+        record_batch = health.record_batch
+        def committed_then_interrupted(*args):
+            record_batch(*args)
+            raise KeyboardInterrupt()
+        with patch.object(health, 'record_batch', side_effect=committed_then_interrupted), self.assertRaises(KeyboardInterrupt):
+            health.check(self.cfg, stage='download')
+        with Catalog(self.cfg) as cat:
+            check = cat.connection.execute('SELECT * FROM health_checks').fetchone()
+            self.assertEqual((check['status'], check['checked'], check['problems']), ('interrupted', 1, 0))
+            self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM health_receipts').fetchone()['n'], 1)
+
+    def test_receipt_failure_rolls_back_the_entire_observation_batch(self):
+        with Catalog(self.cfg) as cat:
+            check_id = cat.connection.execute("INSERT INTO health_checks(scope,status) VALUES('{}','running') RETURNING id").fetchone()['id']
+            results = [('download', dict(accession=FORM4, sha256='a' * 64), []),
+                       ('invalid-stage', dict(id=1, sha256='b' * 64), [])]
+            with self.assertRaises(psycopg.errors.CheckViolation):
+                health.record_batch(cat, check_id, results)
+            self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM health_observations').fetchone()['n'], 0)
+            self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM health_receipts').fetchone()['n'], 0)
+            check = cat.connection.execute('SELECT checked,problems FROM health_checks WHERE id=%s', (check_id,)).fetchone()
+            self.assertEqual((check['checked'], check['problems']), (0, 0))
 
     def test_blocked_download_stops_undispatched_queue(self):
         body = HEADER + record(accession=FORM4) + record(accession=FORM5)

@@ -73,6 +73,28 @@ Unsupported XML may need a parser update rather than another retry. `parse`
 does not silently replace an extraction because it has warnings. Amendments
 remain separate filings, and transactions are not multiplied by joint owners.
 
+`parse --workers 1..20` defaults to four local preparation threads. They verify
+archives, preserve durable source snapshots and extract XML while the coordinator
+publishes the preceding group. Only the coordinator accesses PostgreSQL.
+Preparation queues at most two groups, each capped at 32 filings and 8 MiB of
+recorded source text (a larger individual filing forms a one-filing group).
+The coordinator uses bulk `COPY` for larger typed/evidence tables and commits
+each group atomically, including selections and per-filing attempt receipts.
+Progress counts committed filings; Ctrl+C retains completed groups and makes
+unfinished attempts eligible on the next run. No schema or parser-version
+upgrade is required: extracted values and evidence have unchanged semantics.
+
+For the downloaded 2016-onward collection, use:
+
+```powershell
+insider parse --start 2016-01-01 --dry-run
+insider parse --start 2016-01-01
+```
+
+Larger worker counts are not necessarily faster: XML processing, durable writes
+and database publication share machine resources. Use `--workers 1` for serial
+preparation when comparing throughput; batching and bulk loading remain enabled.
+
 ## Checking and repairing
 
 Discovery status distinguishes `unresolved_sources` (registered sources without
@@ -121,6 +143,48 @@ does not inherit its predecessor's verification. An interrupted check certifies
 only objects it actually finished checking. A zero-object check does not establish
 coverage. Verification describes the recorded time; it cannot detect later disk
 damage without another check.
+
+Download checks fully hash every ZIP and decompress its expected entry, including
+CRC and recorded-length checks. Small ZIPs are read with file-sized buffers;
+large ZIPs are streamed instead of retaining the decompressed submission in
+memory. Configured archive/source limits and data-root path checks still apply.
+`check --workers 1..20` controls concurrent archive verification (default 8).
+The CLI's `--executor auto` uses process workers for selections of at least
+4,096 downloads and grouped thread workers for smaller selections. Processes
+allow ZIP/path-processing work to run on multiple Python interpreters. Use
+`--executor thread` or `--executor process` to select a mode explicitly;
+`--workers 1` always verifies serially. Discovery and extraction checks remain
+sequential, and only the coordinator accesses PostgreSQL.
+
+Workers check small groups (up to 16 files per thread task or 64 per process
+task), avoiding a separate scheduling/IPC operation for every tiny ZIP. Groups
+are capped at 8 MiB of recorded source text, with larger individual filings in
+one-file groups. At most two groups per worker are queued. Full SHA-256, entry,
+decompression/CRC and size checks still run on every selected file; every file
+still receives its own audit observation and receipt. The final report names
+the selected download executor and worker count.
+
+Python callers of `health.check()` retain thread mode by default. Explicit
+`executor='auto'` or `'process'` calls should use a guarded application entry
+point (`if __name__ == '__main__':`) for portable process startup. No additional
+packages or schema migration are required.
+
+Date/form-filtered download checks advance both the submission scan and the
+matching historical-index scan past the last accession on every page. This
+prevents late pages in a large catalogue from rescanning earlier index rows.
+Only archive-verification columns are fetched. Parsing uses the same bounded
+selection rule. Filter meanings and the set of selected filings are unchanged.
+
+Download verification outcomes are committed atomically in batches of up to 256,
+with an immutable observation and latest receipt for every checked file. Progress
+counts committed outcomes. Interruption retains those batches; an unfinished
+batch is not certified. Running the command again checks the selected files
+again, including previously checked files. No schema upgrade is needed for these
+throughput improvements.
+
+The running check's checked/problem counters are updated in the same atomic
+statement as each receipt batch. They remain accurate after an interruption
+immediately following a commit, rather than remaining zero until completion.
 
 Repair first rechecks each finding under the publisher lock:
 

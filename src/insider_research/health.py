@@ -8,12 +8,15 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import multiprocessing
 import re
+import signal
 import shutil
 import tempfile
 import uuid
 import zipfile
 import zlib
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import replace
 from pathlib import Path
 
@@ -28,17 +31,24 @@ from .ownership import PARSER_VERSION, parse_submission
 from .ownership_store import (_safe_path, _selection, publish, read_archive,
                               validate_result, parsing_status, inspect_ownership)
 from .sources.indexes import parse_master_index, source_for
-from .submissions import _publish_zip
+from .submissions import _publish_zip, _verify_registered_submission
 
 STAGES = ('discover', 'download', 'parse')
 CONTENT_ERRORS = (ValueError, OSError, EOFError, zipfile.BadZipFile, zlib.error, RuntimeError)
+CHECK_BATCH_SIZE = 256
+CHECK_PAGE_SIZE = 1024
+CHECK_THREAD_CHUNK = 16
+CHECK_PROCESS_CHUNK = 64
+CHECK_GROUP_BYTES = 8 * 1024 * 1024
+CHECK_PROCESS_THRESHOLD = 4096
+DOWNLOAD_COLUMNS = 's.accession,s.archive_path,s.sha256,s.zip_bytes,s.source_bytes'
 
 
 def targets(catalog, stage, *, count_only=False, **filters):
     """Keyset pages keep million-filing checks bounded in memory."""
     where, params = _selection(**filters)
     if stage == 'download':
-        query = f'SELECT s.* FROM submissions s WHERE {where}'
+        query = f'SELECT {DOWNLOAD_COLUMNS} FROM submissions s WHERE {where}'
         key, after = 'accession', ''
     elif stage == 'parse':
         where = where.replace('s.accession', 'r.accession')
@@ -59,8 +69,14 @@ def targets(catalog, stage, *, count_only=False, **filters):
     def pages():
         nonlocal after
         while True:
-            rows = list(catalog.connection.execute(
-                query + f' AND {alias}.{key}>%s ORDER BY {alias}.{key} LIMIT 100', [*params, after]))
+            if stage == 'download':
+                page_where, page_params = _selection(**filters, accession_after=after)
+                rows = list(catalog.connection.execute(
+                    f'SELECT {DOWNLOAD_COLUMNS} FROM submissions s WHERE {page_where} ORDER BY s.accession LIMIT %s',
+                    [*page_params, CHECK_PAGE_SIZE]))
+            else:
+                rows = list(catalog.connection.execute(
+                    query + f' AND {alias}.{key}>%s ORDER BY {alias}.{key} LIMIT %s', [*params, after, CHECK_PAGE_SIZE]))
             if not rows:
                 return
             for row in rows:
@@ -77,7 +93,11 @@ def identity(stage, row):
 def verify(cfg, catalog, stage, row):
     try:
         if stage == 'download':
-            read_archive(cfg, row)
+            # Verification needs full decompression/CRC, but not a retained
+            # in-memory copy of the entire source as extraction does.
+            problem = _verify_registered_submission(cfg.data_root, row,
+                max_source_bytes=min(cfg.max_submission_bytes, 128 * 1024 * 1024))
+            return [problem['message']] if problem else []
         elif stage == 'parse':
             return validate_result(cfg, catalog, row)
         else:
@@ -113,7 +133,88 @@ def record(catalog, check_id, stage, row, messages):
             checked_at=now(),valid=excluded.valid,messages=excluded.messages''', values)
 
 
-def check(cfg, *, stage=None, progress=None, **filters):
+def record_batch(catalog, check_id, results):
+    """Publish observations and latest receipts atomically in one round trip."""
+    values = []
+    for stage, row, messages in results:
+        target, version = identity(stage, row)
+        values.append(dict(stage=stage, target=target, version=version,
+                           accession=row.get('accession'), valid=not messages, messages=messages))
+    catalog.connection.execute('''WITH observed AS (
+        INSERT INTO health_observations(stage,target,version,accession,check_id,valid,messages)
+        SELECT stage,target,version,accession,%s,valid,messages
+        FROM jsonb_to_recordset(%s) AS t(stage text,target text,version text,
+            accession text,valid boolean,messages jsonb)
+        RETURNING stage,target,version,accession,check_id,checked_at,valid,messages
+    ), receipted AS (
+      INSERT INTO health_receipts(stage,target,version,accession,check_id,checked_at,valid,messages)
+      SELECT stage,target,version,accession,check_id,checked_at,valid,messages FROM observed
+      ON CONFLICT(stage,target,version) DO UPDATE SET check_id=excluded.check_id,
+        checked_at=excluded.checked_at,valid=excluded.valid,messages=excluded.messages
+      RETURNING valid
+    ) UPDATE health_checks SET checked=checked+(SELECT count(*) FROM receipted),
+      problems=problems+(SELECT count(*) FROM receipted WHERE NOT valid) WHERE id=%s''',
+        (check_id, Jsonb(values), check_id))
+
+
+def _check_worker_init():
+    # The coordinator handles Ctrl+C, records interruption and cancels queued
+    # groups. Child processes finish only their bounded in-flight work.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def _verify_download_group(cfg, rows):
+    return [verify(cfg, None, 'download', row) for row in rows]
+
+
+def _download_checks(cfg, rows, workers, executor='thread'):
+    """Bound queued file work; only the caller accesses PostgreSQL/progress."""
+    if workers == 1:
+        for row in rows:
+            yield row, verify(cfg, None, 'download', row)
+        return
+    pool = (ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context('spawn'),
+                                initializer=_check_worker_init) if executor == 'process' else
+            ThreadPoolExecutor(max_workers=workers, thread_name_prefix='integrity'))
+    chunk_size = CHECK_PROCESS_CHUNK if executor == 'process' else CHECK_THREAD_CHUNK
+    with pool:
+        pending = {}
+        rows = iter(rows)
+        exhausted = False
+        carry = None
+        try:
+            while pending or not exhausted:
+                while not exhausted and len(pending) < workers * 2:
+                    group, source_bytes = [], 0
+                    while len(group) < chunk_size:
+                        row = carry if carry is not None else next(rows, None)
+                        carry = None
+                        if row is None:
+                            exhausted = True
+                            break
+                        if group and source_bytes + row['source_bytes'] > CHECK_GROUP_BYTES:
+                            carry = row
+                            break
+                        group.append(row)
+                        source_bytes += row['source_bytes']
+                    if group:
+                        pending[pool.submit(_verify_download_group, cfg, group)] = group
+                if not pending:
+                    break
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    group = pending.pop(future)
+                    yield from zip(group, future.result(), strict=True)
+        finally:
+            for future in pending:
+                future.cancel()
+
+
+def check(cfg, *, stage=None, progress=None, workers=8, executor='thread', **filters):
+    if not 1 <= workers <= 20:
+        raise ValueError('Workers must be between 1 and 20')
+    if executor not in ('auto', 'thread', 'process'):
+        raise ValueError('Executor must be auto, thread or process')
     scope = dict(stage=stage or 'all', **{k: str(v) for k, v in filters.items() if v is not None})
     counts = dict(checked=0, problems=0)
     with Catalog(cfg) as cat, publisher_lock(cfg.data_root, cat):
@@ -121,27 +222,56 @@ def check(cfg, *, stage=None, progress=None, **filters):
             VALUES(%s,'running') RETURNING id''', (Jsonb(scope),)).fetchone()['id']
         try:
             selected_stages = (stage,) if stage else STAGES
+            totals = {}
+            if progress or executor == 'auto':
+                totals = {selected: targets(cat, selected, count_only=True, **filters) for selected in selected_stages}
             if progress:
-                total = sum(targets(cat, selected, count_only=True, **filters) for selected in selected_stages)
-                progress({'event': 'start', 'total': total})
+                progress({'event': 'start', 'total': sum(totals.values())})
+            download_executor = ('process' if totals.get('download', 0) >= CHECK_PROCESS_THRESHOLD else 'thread') if executor == 'auto' else executor
+            if workers == 1:
+                download_executor = 'thread'
             for selected in selected_stages:
-                for row in targets(cat, selected, **filters):
-                    messages = verify(cfg, cat, selected, row)
-                    record(cat, check_id, selected, row, messages)
-                    counts['checked'] += 1
-                    counts['problems'] += bool(messages)
+                rows = targets(cat, selected, **filters)
+                results = (_download_checks(cfg, rows, workers, executor=download_executor) if selected == 'download' else
+                           ((row, verify(cfg, cat, selected, row)) for row in rows))
+                batch = []
+
+                def flush():
+                    if not batch:
+                        return
+                    record_batch(cat, check_id, batch)
+                    counts['checked'] += len(batch)
+                    counts['problems'] += sum(bool(messages) for _, _, messages in batch)
+                    batch.clear()
                     if progress:
                         progress(dict(event='progress', current=counts['checked'], problems=counts['problems']))
+
+                try:
+                    for row, messages in results:
+                        batch.append((selected, row, messages))
+                        if len(batch) >= (CHECK_BATCH_SIZE if selected == 'download' else 1):
+                            flush()
+                    flush()
+                finally:
+                    # Close/cancel a partially consumed worker generator before
+                    # releasing the publisher lock on an error or interruption.
+                    results.close()
             status = 'invalid' if counts['problems'] else 'valid'
         except BaseException:
-            cat.connection.execute("UPDATE health_checks SET status='interrupted',finished_at=now(),checked=%s,problems=%s WHERE id=%s",
-                                   (counts['checked'], counts['problems'], check_id))
+            # Durable counters were committed with the receipts. Do not replace
+            # them with possibly stale Python counters if interruption occurred
+            # just after PostgreSQL committed a batch.
+            cat.connection.execute("UPDATE health_checks SET status='interrupted',finished_at=now() WHERE id=%s",
+                                   (check_id,))
             raise
         cat.connection.execute('UPDATE health_checks SET status=%s,finished_at=now(),checked=%s,problems=%s WHERE id=%s',
                                (status, counts['checked'], counts['problems'], check_id))
-    return dict(status=status, check_id=check_id, scope=scope, **counts,
+    result = dict(status=status, check_id=check_id, scope=scope, **counts,
                 next='insider issues' if counts['problems'] else 'insider status',
                 note='Checks registered indexes, registered downloads and selected extractions. Missing acquisition work is reported by status/issues. No records selected means nothing was verified.')
+    if 'download' in selected_stages:
+        result.update(download_executor=download_executor, workers=workers)
+    return result
 
 
 # Only findings that still describe a current object are actionable. Retained

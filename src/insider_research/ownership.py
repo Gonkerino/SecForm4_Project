@@ -250,7 +250,7 @@ def parse_submission(body: bytes, accession: str) -> Extraction:
     if root is None or _local(root.tag) != "ownershipDocument":
         raise UnsupportedSubmission("Primary document is not ownershipDocument XML")
     # Index every node first, preserving namespace, attributes, text, tail and order.
-    paths, nodes = {}, []
+    paths, nodes, child_index = {}, [], {}
     stack = [(root, "/ownershipDocument[1]", 1)]
     while stack:
         node, path, depth = stack.pop()
@@ -260,11 +260,13 @@ def parse_submission(body: bytes, accession: str) -> Extraction:
             raise ValueError("Ownership XML source path exceeds storage limit")
         paths[id(node)] = path
         nodes.append(node)
-        counts, children = Counter(), []
+        counts, children, grouped = Counter(), [], {}
         for child in node:
             name = _local(child.tag)
             counts[name] += 1
+            grouped.setdefault(name, []).append(child)
             children.append((child, f"{path}/{name}[{counts[name]}]", depth + 1))
+        child_index[id(node)] = grouped
         stack.extend(reversed(children))
 
     consumed = set()
@@ -272,17 +274,20 @@ def parse_submission(body: bytes, accession: str) -> Extraction:
     def find_all(base, relative):
         found = [base]
         for segment in relative.split("/"):
-            found = [child for parent in found for child in parent if _local(child.tag) == segment]
+            found = [child for parent in found for child in child_index[id(parent)].get(segment, ())]
         return found
 
     def consume_ancestors(base, relative):
-        bits = relative.split("/")
-        for i in range(1, len(bits) + 1):
-            consumed.update(id(n) for n in find_all(base, "/".join(bits[:i])))
+        # Traverse once, preserving all matching ancestors (including repeated
+        # and foreign-namespace elements) exactly as the original extraction did.
+        found = [base]
+        for segment in relative.split("/"):
+            found = [child for parent in found for child in child_index[id(parent)].get(segment, ())]
+            consumed.update(id(n) for n in found)
+        return found
 
     def scalar(base, relative, kind):
-        matches = find_all(base, relative)
-        consume_ancestors(base, relative)
+        matches = consume_ancestors(base, relative)
         if not matches:
             return None
         if len(matches) > 1:

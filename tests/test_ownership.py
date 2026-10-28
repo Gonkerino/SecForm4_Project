@@ -7,13 +7,16 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import zipfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from insider_research.catalog import Catalog, connect
+from insider_research.config import Config
 from insider_research.cli import main, parser
 from insider_research.ownership import parse_submission, UnsupportedSubmission
 from insider_research.ownership_store import (parse_ownership, plan_parse, inspect_ownership,
-    parsing_status, validate_ownership, read_archive)
+    parsing_status, validate_ownership, read_archive, TABLES)
 from insider_research.submissions import _publish_zip
 from tests.helpers import postgres_config
 
@@ -153,6 +156,60 @@ class OwnershipParserTests(unittest.TestCase):
         args = parser().parse_args(["parse-ownership"])
         self.assertIsNone(args.start)
         self.assertIsNone(args.limit)
+        self.assertEqual(parser().parse_args(['parse']).workers, 4)
+        self.assertEqual(parser().parse_args(['parse', '--workers', '8']).workers, 8)
+        self.assertEqual(parser().parse_args(['parse-ownership', '--workers', '1']).workers, 1)
+
+    def test_invalid_workers_fail_before_database_access(self):
+        for workers in (0, 21):
+            with self.subTest(workers=workers), self.assertRaisesRegex(ValueError, 'Workers'):
+                parse_ownership(None, workers=workers)
+
+
+class ArchiveReaderTests(unittest.TestCase):
+    def test_sized_read_retains_checksum_length_and_snapshot_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Config(data_root=Path(directory))
+            path = cfg.data_root / 'test.zip'
+            body = source()
+            with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(FORM4 + '.txt', body)
+            archive_bytes = path.read_bytes()
+            row = dict(accession=FORM4, archive_path=path.name, zip_bytes=len(archive_bytes),
+                source_bytes=len(body), sha256=hashlib.sha256(archive_bytes).hexdigest())
+            sizes = []
+            original_open = Path.open
+
+            class Reader:
+                def __init__(self, stream):
+                    self.stream = stream
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    self.stream.close()
+                def fileno(self):
+                    return self.stream.fileno()
+                def read(self, size):
+                    sizes.append(size)
+                    return self.stream.read(size)
+
+            with patch.object(Path, 'open', lambda p, *a, **k: Reader(original_open(p, *a, **k))):
+                self.assertEqual(read_archive(cfg, row), (body, archive_bytes))
+            self.assertEqual(sizes, [len(archive_bytes) + 1])
+            snapshot = dict(row, source_snapshot_path=path.name, source_sha256=row['sha256'])
+            self.assertEqual(read_archive(cfg, snapshot, snapshot=True), (body, archive_bytes))
+            for key, value in (('sha256', '0' * 64), ('zip_bytes', len(archive_bytes) + 1),
+                               ('source_bytes', len(body) + 1)):
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    read_archive(cfg, dict(row, **{key: value}))
+            with patch('insider_research.ownership_store.os.fstat',
+                       return_value=SimpleNamespace(st_size=len(archive_bytes) - 1)):
+                with self.assertRaisesRegex(ValueError, 'changed size'):
+                    read_archive(cfg, row)
+            with patch('insider_research.ownership_store.os.fstat',
+                       return_value=SimpleNamespace(st_size=cfg.max_submission_bytes * 2 + 1024 * 1024 + 1)):
+                with self.assertRaisesRegex(ValueError, 'bounded archive'):
+                    read_archive(cfg, row)
 
 
 class OwnershipDatabaseTests(unittest.TestCase):
@@ -187,6 +244,82 @@ class OwnershipDatabaseTests(unittest.TestCase):
         self.assertEqual(x["transactions"][0]["transaction_shares"], Decimal("4101.766"))
         self.assertEqual(validate_ownership(self.cfg)["status"], "valid")
         self.assertEqual(plan_parse(self.cfg, accession=FORM4)["already_extracted"], 1)
+
+    def test_parallel_batches_match_serial_in_every_typed_and_evidence_table(self):
+        accessions = (FORM3, FORM4, FORM5)
+        for accession in accessions:
+            self.seed(accession)
+        with patch('insider_research.ownership_store.PARSE_BATCH_SIZE', 2):
+            self.assertEqual(parse_ownership(self.cfg, workers=1)['processed'], 3)
+            serial = {a: inspect_ownership(self.cfg, a) for a in accessions}
+            with Catalog(self.cfg) as cat:
+                cat.connection.execute('DELETE FROM ownership_current_results')
+            self.assertEqual(parse_ownership(self.cfg, workers=4)['processed'], 3)
+        for accession in accessions:
+            parallel = inspect_ownership(self.cfg, accession)
+            for table in ('header', 'report', *TABLES):
+                normalize = lambda rows: [{k: v for k, v in row.items() if k != 'result_id'} for row in rows]
+                self.assertEqual(normalize(serial[accession][table]), normalize(parallel[table]), (accession, table))
+        self.assertEqual(validate_ownership(self.cfg)['results_checked'], 6)
+        self.assertEqual(validate_ownership(self.cfg)['status'], 'valid')
+        self.assertEqual(parse_ownership(self.cfg)['processed'], 0)
+
+    def test_parallel_failure_and_unsupported_cases_do_not_discard_valid_results(self):
+        self.seed(FORM3, source(FORM3).replace(b'</issuer>', b'</bad>'))
+        self.seed(FORM4)
+        self.seed(FORM5, source(FORM5).replace(b'ownershipDocument', b'unsupportedDocument'))
+        result = parse_ownership(self.cfg, workers=4)
+        self.assertEqual((result['processed'], result['failed'], result['unsupported']), (3, 1, 1))
+        self.assertIsNotNone(inspect_ownership(self.cfg, FORM4)['result'])
+        self.assertEqual(plan_parse(self.cfg)['previous_failures_excluded'], 2)
+        with Catalog(self.cfg) as cat:
+            failed = list(cat.connection.execute("SELECT * FROM parse_attempts WHERE status IN ('failed','unsupported')"))
+        self.assertTrue(all(r['source_snapshot_path'] and r['source_text_sha256'] for r in failed))
+
+    def test_pipeline_interruption_preserves_committed_group_and_resumes_prefetch(self):
+        for accession in (FORM3, FORM4, FORM5):
+            self.seed(accession)
+        def progress(event):
+            if event['event'] == 'progress':
+                raise KeyboardInterrupt()
+        with patch('insider_research.ownership_store.PARSE_BATCH_SIZE', 2), self.assertRaises(KeyboardInterrupt):
+            parse_ownership(self.cfg, workers=4, progress=progress)
+        with Catalog(self.cfg) as cat:
+            run = cat.connection.execute("SELECT * FROM runs WHERE command='parse-ownership'").fetchone()
+            self.assertEqual((run['status'], run['summary_json']['processed']), ('interrupted', 2))
+            self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM parse_results').fetchone()['n'], 2)
+            self.assertEqual(cat.connection.execute("SELECT count(*) AS n FROM parse_attempts WHERE status='interrupted'").fetchone()['n'], 1)
+        self.assertEqual(parse_ownership(self.cfg, workers=4)['processed'], 1)
+        self.assertEqual(validate_ownership(self.cfg)['status'], 'valid')
+
+    def test_byte_budget_and_limit_keep_prefetch_bounded(self):
+        for accession in (FORM3, FORM4, FORM5):
+            self.seed(accession)
+        events = []
+        with patch('insider_research.ownership_store.PARSE_BATCH_BYTES', 1):
+            result = parse_ownership(self.cfg, workers=4, limit=2, progress=events.append)
+        self.assertEqual((result['processed'], result['unattempted_eligible']), (2, 1))
+        self.assertEqual([e['current'] for e in events if e['event'] == 'progress'], [1, 2])
+        with Catalog(self.cfg) as cat:
+            self.assertEqual(cat.connection.execute('SELECT count(*) AS n FROM parse_attempts').fetchone()['n'], 2)
+        self.assertEqual(parse_ownership(self.cfg)['processed'], 1)
+
+    def test_copy_interruption_rolls_back_entire_group(self):
+        from insider_research.ownership_store import _insert
+        for accession in (FORM3, FORM4, FORM5):
+            self.seed(accession)
+        def interrupted(connection, table, rows):
+            if table == 'ownership_fields':
+                raise KeyboardInterrupt()
+            return _insert(connection, table, rows)
+        with patch('insider_research.ownership_store._insert', side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
+            parse_ownership(self.cfg, workers=4)
+        with Catalog(self.cfg) as cat:
+            for table in ('parse_results', 'ownership_current_results', 'ownership_reports', *TABLES.values()):
+                self.assertEqual(cat.connection.execute(f'SELECT count(*) AS n FROM {table}').fetchone()['n'], 0)
+            self.assertEqual(cat.connection.execute("SELECT count(*) AS n FROM parse_attempts WHERE status='interrupted'").fetchone()['n'], 3)
+        self.assertEqual(parse_ownership(self.cfg)['processed'], 3)
+        self.assertEqual(validate_ownership(self.cfg)['status'], 'valid')
 
     def test_failures_retry_and_successful_results_survive(self):
         self.seed(FORM4)
