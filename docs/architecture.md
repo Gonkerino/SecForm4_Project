@@ -26,7 +26,7 @@ Connections use autocommit for standalone statements and explicit transaction bl
 
 ## Publication, locking and recovery
 
-An OS file lock protects the local artifact directory. A PostgreSQL session advisory lock, keyed by application schema and scoped to the database, prevents another cooperating publisher even if it uses a different local lock path. Initialization uses the same key. OS/session termination releases locks. Discovery and submission commands share the publisher locks, so only one cooperating publishing command runs at a time. Within a submission run, worker threads fetch and publish separate accession ZIPs; the coordinating thread owns the catalogue connection and commits attempt/archive records.
+An OS file lock protects the local artifact directory. A PostgreSQL session advisory lock, keyed by application schema and scoped to the database, prevents another cooperating publisher even if it uses a different local lock path. Initialization uses the same key. OS/session termination releases locks. Download and parse commands use separate exclusive lanes beneath a shared maintenance gate, allowing one of each concurrently. Discovery and maintenance retain exclusive access. Within a submission run, worker threads fetch and publish separate accession ZIPs; the coordinating thread owns the catalogue connection and commits attempt/archive records.
 
 `recover` holds both locks before marking abandoned discovery and submission records interrupted. Previously committed revisions remain available. Filesystem publication and PostgreSQL commit are separate: a failure between them may leave an unregistered artifact, which remains invisible to readers. Submission retries replace deterministic per-accession ZIP paths only after validating their contents; index orphan adoption remains future work.
 
@@ -62,17 +62,17 @@ Integration tests use a separately configured PostgreSQL test database, randomly
 
 ## Local dashboard
 
-`insider dashboard` runs a read-only standard-library `ThreadingHTTPServer` on `127.0.0.1` (port 8765 by default). The bundled HTML contains a single monthly coverage strip. GET `/api/coverage` returns every month from July 2003 through the present in SEC/New York time. POST requests are rejected; the previous action, inspection and listing routes are removed. CLI operations remain available independently.
+`insider dashboard` runs a read-only standard-library `ThreadingHTTPServer` on `127.0.0.1` (port 8765 by default). The bundled HTML contains aligned monthly download and parsing strips. The UI defaults to the current year, with 2016-onward and full-history presets. GET `/api/coverage?start=YYYY-MM-01` selects the range; omitting start retains the July 2003 boundary. Dates use SEC/New York time. POST requests are rejected; the previous action, inspection and listing routes are removed. CLI operations remain available independently.
 
 One repeatable-read, read-only PostgreSQL transaction aggregates current associations by accession/month and joins registered submissions. Distinct accessions avoid double-counting entities and daily/quarterly overlaps. The active quarterly artifact's most recent validated online attempt (or first observation for an imported artifact) establishes whether a month has a known index denominator. Offline cache replay cannot advance this date. Only months whose index was observed after month end can be complete; daily-only or absent coverage and the open month retain an unknown expected count. Zero downloaded filings always produce an empty/red state, including a known zero-filing index; only a positive, fully downloaded count can be green. Registered archive counts do not revalidate disk contents.
 
-The browser refreshes every ten seconds while visible and exposes monthly counts on hover, focus or tap. Arrow keys, Home and End navigate the strip. There are no background jobs or operation controls in the dashboard. The server checks Host headers, uses bundled assets with a restrictive content policy, and requires no new dependencies or schema migrations. It is intended for local account use, not remote hosting.
+The browser checks current-year and 2016 views every thirty seconds while visible, and full history every sixty seconds. A bounded, synchronized cache shares snapshots across tabs. Queries use transaction-local memory limits and a statement timeout without changing server defaults. Monthly counts are available on hover, focus or tap. Summary cards and an aggregate progress bar sum the returned monthly counts for the selected range in the browser, with no additional database queries. The summary stays fixed while exploring individual months; its extracted percentage uses total extracted divided by total downloads, rather than averaging monthly percentages. Parsing joins selected results by source checksum and current or explicitly compatible parser semantics (unaffected v1/v2 results remain compatible with v3; date/plan and missing-code review cases upgrade selectively), and uses latest matching outstanding attempts; review cases are counted as extracted but shown separately. Left/right arrows, Home and End navigate months; up/down arrows switch strips. There are no background jobs or operation controls in the dashboard. The server checks Host headers, uses bundled assets with a restrictive content policy, and requires no new dependencies or schema migrations. It is intended for local account use, not remote hosting.
 
 The main research dataset starts on **1 July 2003**, the first full month after electronic ownership filing became mandatory on 30 June 2003 ([SEC rule](https://www.sec.gov/files/rules/final/33-8230.htm)). `config.RESEARCH_START` is the shared boundary for the dashboard, legacy CLI filing listings/downloads and the Python submission-download entry point. Explicit earlier CLI dates remain supported. Status, validation and low-level catalogue queries cover all retained records. No historical observations or files are deleted.
 
 The general index planner retains its July 1994 lower bound and requires explicit dates; use a start of 2003-07-01 for principal research discovery. Voluntary electronic ownership filing began on 18 December 1995 ([SEC announcement](https://www.sec.gov/news/digest/1995/dig111495.pdf)); pre-mandate electronic records omit paper reports and remain supplementary archival data. Future forecasting datasets must use public information-availability timing to avoid look-ahead bias. Ownership extraction is available; publication-time research snapshots, market-price alignment and statistical evaluation remain outside current functionality.
 
-Unindexed months have a separate grey state: no monthly filing observations or applicable active index source. A validated daily source or a quarterly observation reaching the month establishes index presence even for zero ownership rows; it does not necessarily establish full-month coverage. The coverage endpoint also returns the latest validated index attempt timestamp/source, labelled when offline. Failed attempts and submission downloads do not advance this timestamp. The UI separately timestamps its last successful fetch and renders both times in Europe/London.
+Unindexed months have a separate grey state: no monthly filing observations or applicable active index source. A validated daily source or a quarterly observation reaching the month establishes index presence even for zero ownership rows; it does not necessarily establish full-month coverage. The coverage endpoint also returns the latest validated index attempt timestamp/source, labelled when offline. Failed attempts and submission downloads do not advance this timestamp. The UI also timestamps the latest selected-range extraction and the read snapshot. Timestamps render in Europe/London.
 
 
 ## Unified operations and schema 4
@@ -91,3 +91,36 @@ each outcome, `health_receipts` stores the latest per-object/version outcome,
 and `repair_attempts` audits repair outcomes. `parse_results.supersedes_result_id`
 links extraction repairs. Normal parsing remains idempotent; controlled repair
 can publish another result for the same source and parser version.
+
+
+Parsing preparation and publication are separate bounded stages. Four source
+workers prepare files (spawned processes for 4,096+ queued filings, threads for
+smaller runs; serial with one worker). Process tasks contain up to 16 filings to
+amortize IPC costs. Child processes receive only configuration and filing metadata;
+they never inherit or open database connections. Configurable database workers, each with its own connection,
+publish complete atomic batches using the existing COPY and constraints.
+The default writer count is two for 4,096+ queued filings with multiple
+preparation workers, and one for smaller runs or serial preparation. Explicit
+executor/writer options override these defaults. The dry-run preview and actual
+execution share the same policy, based on queued work after applying a limit.
+The coordinator owns the external publisher locks, bounds retained groups to
+write-workers + 1, and releases locks only after publishers have drained. Failure
+accounting includes independently committed siblings; uncommitted attempts remain
+resumable. `--write-workers 1` provides serialized publication.
+
+The local 32 GiB Windows machine uses 2 GiB shared_buffers, a 12 GiB
+effective_cache_size planner estimate, and 4 GiB max_wal_size. These are local
+cluster settings, not application defaults or memory allocated by each parser.
+Fsync, full_page_writes and synchronous_commit remain enabled; work_mem remains
+4 MiB. The preceding cluster configuration and rollback SQL are retained under
+the ignored data/reports directory.
+
+
+Download and parse commands may run concurrently. Each holds a shared PostgreSQL
+maintenance gate and its own exclusive local/database lane lock; a second command
+in the same lane is rejected. Discovery, check, repair, recover and initialization
+retain the exclusive gate and cannot overlap either command. Terminating a process
+releases its locks; recover can mark abandoned attempts only after active publishers
+have exited. Parsing freezes eligible committed submission identities at run start
+in a temporary database table; later downloads are eligible on the next parse run.
+Archives are validated and atomically published before their database registration.

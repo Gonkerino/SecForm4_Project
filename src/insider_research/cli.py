@@ -5,6 +5,7 @@ import argparse
 import json
 import sys
 from concurrent.futures.process import BrokenProcessPool
+from concurrent.futures import BrokenExecutor
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -17,7 +18,7 @@ from .catalog import Catalog
 from .config import load_config
 from .discovery import discover
 from .ownership_store import (plan_parse, parse_ownership, parsing_status,
-                              inspect_ownership, validate_ownership)
+                              inspect_ownership, validate_ownership, parsing_execution)
 from .progress import Progress
 from .sources.indexes import ACCESSION, plan_sources
 from .submissions import download_submissions
@@ -73,8 +74,14 @@ def parser():
             if name == 'download':
                 cmd.add_argument('--workers', type=int, default=10)
             if name == 'parse':
+                cmd.add_argument('--upgrade-only', action='store_true',
+                    help='Reprocess only affected published results from supported older parsers; skip unparsed files')
                 cmd.add_argument('--workers', type=int, default=4,
                     help='Concurrent local preparation workers, 1-20 (default: 4)')
+                cmd.add_argument('--write-workers', type=int,
+                    help='Independent durable database publishers, 1-4 (default: 2 for 4096+ queued filings, otherwise 1; serial preparation defaults to 1)')
+                cmd.add_argument('--executor', choices=('auto','thread','process'), default='auto',
+                    help='Preparation workers (default: auto uses chunked processes for 4096+ queued filings)')
             if name == 'check':
                 cmd.add_argument('--stage', choices=health.STAGES)
                 cmd.add_argument('--workers', type=int, default=8,
@@ -110,10 +117,13 @@ def parser():
         cmd = sub.add_parser(name)
         if name in ('parse-ownership', 'plan-parse'):
             _filters(cmd)
+            cmd.add_argument('--upgrade-only', action='store_true')
             cmd.add_argument('--retry-failed', action='store_true')
             if name == 'parse-ownership':
                 cmd.add_argument('--limit', type=int)
                 cmd.add_argument('--workers', type=int, default=4)
+                cmd.add_argument('--write-workers', type=int)
+                cmd.add_argument('--executor', choices=('auto','thread','process'), default='auto')
         if name == 'inspect-ownership':
             cmd.add_argument('accession')
             cmd.add_argument('--result-id', type=int)
@@ -208,15 +218,18 @@ def main(argv=None):
                 result = health.check(cfg, stage=args.stage, workers=args.workers,
                                       executor=args.executor, progress=progress, **filters)
         elif args.command in ('parse', 'parse-ownership', 'plan-parse'):
-            if not 1 <= getattr(args, 'workers', 4) <= 20:
-                raise ValueError('Workers must be between 1 and 20')
+            filters['upgrade_only'] = args.upgrade_only
+            execution_options = dict(workers=getattr(args,'workers',4),
+                write_workers=getattr(args,'write_workers',None), executor=getattr(args,'executor','auto'))
+            parsing_execution(total=0, **execution_options)
             if args.command == 'plan-parse' or getattr(args, 'dry_run', False):
                 result = plan_parse(cfg, retry_failed=args.retry_failed, **filters)
-                result.update(dry_run=True, queued=min(result['eligible'], limit) if limit else result['eligible'])
+                queued = min(result['eligible'], limit) if limit else result['eligible']
+                result.update(dry_run=True, queued=queued, **parsing_execution(total=queued, **execution_options))
             else:
                 with Progress('Parsing ownership', 'filing') as progress:
                     result = parse_ownership(cfg, retry_failed=args.retry_failed, limit=limit,
-                                             workers=args.workers, progress=progress, **filters)
+                                             progress=progress, **execution_options, **filters)
         elif args.command == 'parsing-status':
             result = parsing_status(cfg)
         elif args.command == 'inspect-ownership':
@@ -260,7 +273,13 @@ def main(argv=None):
         print('Error: PostgreSQL operation failed. Check permissions, schema and server availability.', file=sys.stderr)
         return 1
     except BrokenProcessPool:
-        print('Error: archive verification worker exited unexpectedly. Retry check with --executor thread.', file=sys.stderr)
+        if args.command in ('parse', 'parse-ownership'):
+            print('Error: parsing worker exited unexpectedly. Committed batches are retained; retry parse with --executor thread.', file=sys.stderr)
+        else:
+            print('Error: archive verification worker exited unexpectedly. Retry check with --executor thread.', file=sys.stderr)
+        return 1
+    except BrokenExecutor:
+        print('Error: parsing worker could not start. Committed batches are retained; rerun parse after checking PostgreSQL.', file=sys.stderr)
         return 1
     except (ValueError, OSError) as exc:
         print(f'Error: {exc}', file=sys.stderr)

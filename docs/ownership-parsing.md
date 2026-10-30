@@ -32,14 +32,26 @@ July 2003 and records no longer present in active index revisions. `--start`,
 `--accession` selects one accession. `--limit` bounds a batch to 1â€“10,000 records;
 omitting it processes all eligible records at the start of the locked run.
 
-Discovery, downloads and parsing currently share the publisher lock. Only one
-cooperating writer runs at a time. The parser uses bounded keyset pages, four
-preparation threads by default (`--workers 1..20`), and bulk database publication.
-Preparation overlaps publication of the preceding group; at most two groups of
-32 filings/8 MiB recorded source text are queued (a larger filing forms a
-one-filing group). Each group's typed data, evidence, selected results and attempt receipts
-commit together. A batch may be interrupted with Ctrl+C; committed groups
-survive and unfinished attempts are retryable. After a hard process crash,
+One downloader and one parser may run concurrently, with separate exclusive
+command locks. Discovery and maintenance exclude both. Each parser run freezes
+its queue at startup; later downloads are picked up next time. The parser uses bounded
+keyset pages and four preparation workers (`--workers 1..20`). Runs with 4,096
+or more queued filings default to spawned process preparation and two database
+publishers. Smaller runs use threads and one publisher; one preparation worker
+defaults to serial preparation and one publisher.
+`--executor thread|process` overrides auto selection. Process IPC groups at most
+16 filings per task inside the existing publication bounds; no child accesses
+PostgreSQL or inherits the coordinator's connection. The CLI has a guarded
+spawn entrypoint, and Python callers should supply their own main guard. Explicit `--write-workers 1..4` overrides the writer default; benchmark the
+filing mix before increasing beyond two. Each publisher owns its
+connection and commits a complete group atomically. Preparation never accesses
+PostgreSQL. At most `write-workers + 1` groups of 64 filings/8 MiB recorded source
+text are retained (a larger filing forms a one-filing group). Each group's typed
+data, evidence, selected results and attempt receipts commit together. Ctrl+C
+cancels queued publications and drains active transactions before reconciling
+attempts or releasing the publisher locks; all successful commits are retained
+and counted, including sibling batches committed during failure cleanup.
+Unfinished attempts remain retryable. After a hard process crash,
 `insider recover` marks abandoned running attempts/runs interrupted under the lock.
 
 ```powershell
@@ -51,11 +63,46 @@ insider inspect-ownership 0000001750-26-000002 --result-id 123
 ```
 
 Failed/unsupported attempts are excluded on subsequent runs unless
-`--retry-failed` is supplied. A changed source checksum or parser version is a new
-input and becomes eligible. Published `needs_review` results are preserved and
-skipped for the same parser/source; resolve their cause and release a new parser
-version to re-extract them. Do not silently change extraction semantics without
-bumping `PARSER_VERSION`.
+`--retry-failed` is supplied. A changed source checksum or incompatible parser
+version is a new input and becomes eligible. Published `needs_review` results
+are preserved and skipped for the same parser/source. Extraction changes bump
+`PARSER_VERSION`; older results and their attempt receipts remain immutable.
+
+`ownership-2` accepts XML dates with valid `Z` or signed timezone suffixes,
+retaining the stated calendar date and the full raw field text. It also removes
+the keyword-based `plan_evidence_conflict` warning: a 10b5-1 mention alone cannot
+establish a conflict with the checkbox. Checkbox and footnotes remain independent
+evidence. This includes positive mentions as well as negations and amendments;
+the parser makes no automatic plan-status determination from prose.
+
+Unaffected `ownership-1` results remain compatible. Only v1 results with the old
+plan warning or invalid-date issues need upgrading. Run the bounded upgrade
+without starting the unparsed backlog:
+
+```powershell
+insider parse --upgrade-only --dry-run
+insider parse --upgrade-only
+```
+
+Date/form/accession filters, limits and workers also apply to this operation.
+It verifies local sources, publishes new v2 results atomically, links them to the
+results they supersede, and leaves the previous results available for inspection.
+It is resumable and idempotent. Other/unknown parser versions are not implicitly
+compatible.
+
+`ownership-3` aligns transaction-code validation with the SEC v5.4 and v5.5
+ownership schemas: the complete `transactionCoding` block is optional on
+non-derivative and derivative transactions in Forms 4/4A/5/5A. An omitted block
+leaves all coding values NULL and emits an `unreported_transaction_code` warning,
+not a blocking review issue. If the block is supplied but its required code is
+absent, `missing_transaction_field` remains a review issue. Other required
+transaction fields retain their existing validation. No code is inferred from
+prices, acquisition/disposal indicators, footnotes or similar transactions.
+
+Unaffected v1 and v2 results remain compatible; `parse --upgrade-only` also selects
+older results with missing-code review issues for v3 replay. Prior v1/v2 results
+remain immutable and can be replayed with their recorded semantics. Missing codes
+still matter for research classification even when extraction is complete.
 
 Exit 0 means the selected batch completed without review/failure cases. It does
 not mean the entire archive has been parsed: a limit or excluded earlier failure
@@ -147,6 +194,8 @@ transactions and then sum the duplicated transaction quantities.
   PostgreSQL `NUMERIC` and Python `Decimal` (no two-decimal-place rounding).
 - Invalid numeric/date/boolean text remains in `ownership_fields`, with the typed
   column NULL and a review issue. No comma stripping or guessed conversions.
+  XML date timezone offsets are validated up to ±14:00; the calendar date is
+  preserved without converting it to a different UTC day.
 - Absent fields have no XML-node record. Present empty nodes have state `empty`;
   `footnote_only` marks wrappers carrying notes without values. Explicit zero is
   a value, not missing. Structural nodes have state `container`.
@@ -163,7 +212,8 @@ Unknown elements/attributes, repeated scalar values, invalid values and missing
 required structure produce review issues. Known containers do not make unknown
 descendants disappear. Footnote references remain even when missing or ambiguous;
 duplicate footnote IDs are retained as occurrences and flagged. Reported plan
-flags and contradictory plan text remain separate evidence.
+flags and plan text remain separate evidence; keyword mentions do not generate
+a conflict warning.
 
 ## Publication, recovery and validation
 
@@ -178,17 +228,19 @@ claim of fully understood content. `parsing-status` separates current source/par
 matches from older selected results and reports issue categories and latest attempts.
 
 `validate-ownership` opens a repeatable-read read-only database snapshot, checks
-every retained result's source ZIP/text hash and replays its source through the
-current parser, comparing typed tables, document inventory, all field evidence,
+every retained result's source ZIP/text hash and replays its source using the
+recorded v1, v2 or v3 semantics, comparing typed tables, document inventory, all field evidence,
 notes, signatures, issue status/counts and attempt receipts. Index-comparison
 warnings retain their original observation rather than being recomputed from a
-possibly revised index. A retained result using a different parser version is
-reported as replay-unavailable (source still checked); keep old code if exact
-historical replay is required. Validation does not repair records or establish
+possibly revised index. Unknown parser versions are reported as replay-unavailable
+(source still checked). Ownership-1, ownership-2 and ownership-3 replay are supported. Validation does not repair records or establish
 the truth of the filing, complete SEC coverage or research eligibility.
 
 Back up PostgreSQL **and** the data root, including `raw/submission_versions`.
-The monthly dashboard still reports downloaded submissions, not parsing readiness.
+The monthly dashboard shows both downloads and current extraction coverage,
+including review cases, failed/unsupported attempts and remaining work. This
+coverage does not replace integrity verification. See the CLI guide for scope,
+refresh intervals and the distinction between extracted and review-ready data.
 
 ## Extension boundaries
 
@@ -202,3 +254,11 @@ ownership tables. No feature bank, market data or analysis is added in schema 3.
 Tests use reviewed unchanged public sources under `tests/fixtures/ownership/`,
 explicit synthetic transformations and the existing isolated PostgreSQL test
 database with temporary schemas. There is no SEC access during tests.
+
+Batch selection evaluates filters and retry eligibility once when constructing the
+indexed temporary queue. Each page seeks past the last scheduled accession and
+limits queue identities before joining submission metadata. Completed prefixes
+and eligibility tables are not rescanned per batch. Queue statistics are analyzed
+at startup. The parser lane, maintenance gate, atomic batch commits and interruption
+reconciliation remain in force; a resumed command rebuilds eligibility from durable
+results and attempts, including newly downloaded filings.

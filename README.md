@@ -16,7 +16,7 @@ insider status
 ```
 
 For integrity and recovery: **`insider check` -> `insider issues` -> `insider repair --dry-run` -> `insider repair`**.
-Use `insider show ACCESSION` to inspect a filing, and `insider dashboard` for acquisition coverage.
+Use `insider show ACCESSION` to inspect a filing, and `insider dashboard` for download and parsing coverage.
 Add `--json` for machine output. Preview acquisition/parsing with `--dry-run`.
 Discovery and downloading remain separate explicit steps.
 
@@ -62,6 +62,19 @@ If needed, manage the server:
 ```
 
 `start` is safe to repeat. Stop/restart disconnect active database sessions. Server messages are in `D:/Projects/SecForm4/data/postgres/server.log`. The helper reads the installation paths from `%LOCALAPPDATA%/Programs/PostgreSQL/18/insider-research-install.json`; it does not contain passwords.
+
+The local cluster is tuned for this 32 GB machine: `shared_buffers=2GB`,
+`effective_cache_size=12GB` (a planner estimate), and `max_wal_size=4GB`.
+Fsync, full-page writes and synchronous commits remain enabled. Configuration
+backups and rollback SQL are retained under the ignored `data/reports/` directory.
+Parsing defaults to four preparation workers. For 4,096+ queued filings it
+uses chunked spawned processes and two independent atomic database publishers;
+smaller runs use threads and one publisher. You can use
+`insider parse --start 2020-01-01` without additional performance flags.
+`--dry-run` shows the resolved settings. Explicit `--executor` and
+`--write-workers` options remain available; `--workers 1` defaults to serial
+preparation and one publisher. The gains depend on the filing mix and storage.
+
 
 For an administrator SQL session using the saved password:
 
@@ -158,7 +171,7 @@ The schema is dedicated to this application and bound to its data-root path. Ini
 
 The project's main research dataset starts on **1 July 2003**. Electronic filing of Forms 3, 4 and 5 became mandatory on **30 June 2003**, making July the first full month under that requirement. This avoids using the earlier voluntary electronic sample as the main forecasting dataset. See the [SEC's mandatory electronic filing rule](https://www.sec.gov/files/rules/final/33-8230.htm).
 
-The dashboard begins in July 2003. `filings` and `download-submissions` default to `--start 2003-07-01`; the Python submission-download function uses the same default. Explicit earlier start dates remain supported for archival investigations. `status` and integrity checks cover the whole catalogue, including retained earlier records. The dashboard's green means registered downloads match the loaded index.
+The dashboard offers history from July 2003 and opens on the current year. `filings` and `download-submissions` default to `--start 2003-07-01`; the Python submission-download function uses the same default. Explicit earlier start dates remain supported for archival investigations. `status` and integrity checks cover the whole catalogue, including retained earlier records. The dashboard's green means registered downloads match the loaded index.
 
 Discovery requires explicit dates and still accepts the general index range from July 1994. Use `--start 2003-07-01` for the principal research period. Whole-quarter discovery may include dates outside a partial-quarter selection. Earlier catalogue records and downloaded files are retained.
 
@@ -166,13 +179,15 @@ Voluntary electronic ownership filing became effective on 18 December 1995 ([SEC
 
 ## Local dashboard
 
-Run `insider dashboard` to open a read-only monthly coverage strip at `http://127.0.0.1:8765`. Keep the terminal running; Ctrl+C stops it. Use `--port 8766` for another port or `--no-browser` to serve without opening a tab. Configuration is shared with the CLI.
+Run `insider dashboard` to open read-only monthly download and parsing coverage at `http://127.0.0.1:8765`. Keep the terminal running; Ctrl+C stops it. Use `--port 8766` for another port or `--no-browser` to serve without opening a tab. Configuration is shared with the CLI.
 
-One bar represents each month from July 2003 (the first full month of mandatory electronic ownership filing) through the current SEC/New York month. Hover, tap or use arrow keys to see unique indexed filings, registered submission downloads, the expected total and remaining count when known. All six ownership forms are included; duplicate indexed entities and overlapping sources count once per accession/month. Counts refresh every ten seconds while visible. The strip opens at the newest months and scrolls horizontally on narrower screens. Bar height scales linearly with the number of unique indexed filings in that month, relative to the largest month across the entire timeline. Heights stay comparable while scrolling. A four-pixel minimum keeps empty or very small months available for inspection; green fill still represents the downloaded fraction.
+The dashboard opens on the current SEC/New York year. Choose **2016 onward** or **Full history** to explore earlier months, back to July 2003. One bar represents each month in the selected range. Hover, tap or use arrow keys to see unique indexed filings, registered submission downloads, the expected total and remaining count when known. All six ownership forms are included; duplicate indexed entities and overlapping sources count once per accession/month. The current-year and 2016 views check for updates every thirty seconds while visible; full history checks every sixty seconds. Server caching shares results across tabs. The strip opens at the newest months and scrolls horizontally on narrower screens. Bar height scales linearly with the number of unique indexed filings in that month, relative to the largest month in the selected range. Heights stay comparable while scrolling. A four-pixel minimum keeps empty or very small months available for inspection; green fill still represents the downloaded fraction.
 
 Grey means no index has been loaded for that month. Red means an index is loaded but no submissions are downloaded; partial months fill green from the bottom in proportion to downloaded/expected filings, with red above; amber indicates partial downloads with an unknown expected total; green means all expected submissions in a closed month are registered. An expected total is available only with a quarterly index observed after that month ended. Offline cache replay does not advance the index freshness date. Missing/daily-only/stale indexes leave the total unknown; the current month remains provisional. A month with zero downloaded filings stays red, even when its loaded index contains zero ownership filings. Completeness is relative to the loaded index, not an independent SEC census or fresh disk-integrity check. Use the CLI for downloading, discovery, validation and recovery; the dashboard exposes no write actions.
 
-The Last indexed panel shows the most recent successful index load and its source period, including local imports/cache replays labelled as such. Failed attempts and submission downloads do not advance it. View refreshed shows the last successful dashboard fetch; both timestamps display London time.
+A second strip shows parsing as a fraction of registered downloads: completed extractions in green, extracted review cases in amber, failed/unsupported cases in red, recorded in-progress work in blue, and waiting work in grey. Hover or focus a month for counts, including completed-with-warning cases. Stable range totals show extracted count and percentage, completed without issues, completed with warnings, review cases, not yet extracted, failed/unsupported, in progress and waiting, with an overall progress bar and downloaded/indexed totals. These totals cover every month in the selected period and do not change on hover; monthly details stay in the tooltip. Only selected results matching the current source and current or explicitly compatible parser count; unaffected ownership-1/2 results remain compatible with ownership-3, while old date/plan-warning and missing-code review cases require an upgrade. An omitted optional coding block completes with a warning and retains NULL codes; the parser does not infer transaction classifications. Other versions remain pending. Download and parsing completeness have separate denominators.
+
+The Last indexed panel shows the most recent successful index load and its source period, including local imports/cache replays labelled as such. Failed attempts and submission downloads do not advance it. Last parsed shows the latest current extraction in the selected range. Data refreshed shows the database snapshot time, including when a cached response is used. All timestamps display London time.
 
 The server binds only to loopback, checks request hosts, serves bundled assets, and requires no additional dependencies. Restart an already-running dashboard after code updates.
 
@@ -250,7 +265,7 @@ insider download-submissions --retry-failed --limit 100
 insider validate-submissions
 ```
 
-Each archive is stored at `raw/submissions/accession=<first 10 accession digits>/<accession>.zip`, with the original SEC text at the ZIP root as `<accession>.txt`. The raw submission bytes are retained unchanged inside the ZIP. The catalogue records the ZIP SHA-256, ZIP/source lengths, source URL and download time. Downloads use the configured SEC identity, pacing, HTTPS-only SEC redirects, bounded response sizes, timeouts and retries. Before publication, responses must be nonempty, contain no null bytes, and include SEC document/header markers and the requested accession in the first 64 KiB. These checks reject common error responses; they do not fully parse or establish completeness of the SGML document. Files are written to a temporary ZIP, reopened and checksum-verified, then atomically renamed; PostgreSQL marks the filing downloaded only after publication. The publisher lock prevents overlapping writers.
+Each archive is stored at `raw/submissions/accession=<first 10 accession digits>/<accession>.zip`, with the original SEC text at the ZIP root as `<accession>.txt`. The raw submission bytes are retained unchanged inside the ZIP. The catalogue records the ZIP SHA-256, ZIP/source lengths, source URL and download time. Downloads use the configured SEC identity, pacing, HTTPS-only SEC redirects, bounded response sizes, timeouts and retries. Before publication, responses must be nonempty, contain no null bytes, and include SEC document/header markers and the requested accession in the first 64 KiB. These checks reject common error responses; they do not fully parse or establish completeness of the SGML document. Files are written to a temporary ZIP, reopened and checksum-verified, then atomically renamed; PostgreSQL marks the filing downloaded only after publication. Separate command locks allow one downloader and one parser to run together while rejecting duplicate downloaders or parsers. Discovery and maintenance still require exclusive access. Each parser run processes a fixed queue of downloads committed at startup; later downloads are picked up by the next run.
 
 Failed filings remain visible in attempt history and do not count as downloaded. HTTP 403 or a final HTTP 429 failure stops scheduling new downloads; already dispatched workers finish. Rerunning skips verified catalogue entries, resumes unattempted/interrupted filings, and leaves latest failures for an explicit `--retry-failed`. Files published just before a crash but not registered in PostgreSQL are safely replaced on retry. `recover` marks their in-progress attempts interrupted. Downloading the full historical set can take substantial time and disk space; `--limit` and filters let you build coverage in smaller batches. The final JSON reports the indexed total, requested/downloaded/failed counts, remaining count and `coverage_complete` for the selected current catalogue entries. Exit status 0 means the queued batch succeeded; excluded failures or a batch limit can still leave `coverage_complete` false. Registered archives are skipped without rechecking disk contents on every run; use `validate-submissions` to detect missing or damaged ZIPs. This download step does not parse ownership transactions or download issuer/owner exhibits separately; use the local extraction commands below.
 
@@ -288,7 +303,7 @@ original ZIPs. Preserve these copies in backups.
 
 `validate-ownership` replays retained sources and checks stored extraction fidelity;
 it does not repair files or claim the source is true. Use `parsing-status` to see
-review/failure cases. The monthly dashboard continues to show download coverage.
+review/failure cases. The monthly dashboard also shows current extraction coverage and remaining work.
 See [ownership extraction](docs/ownership-parsing.md) for table meanings, current
 SQL views, missing-value rules, versioning and recovery.
 

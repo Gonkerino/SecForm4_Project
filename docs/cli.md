@@ -31,15 +31,47 @@ long-lived dashboard processes after upgrading the installed code/schema.
 | `issues` | Browse integrity failures, failed attempts and source review cases |
 | `repair` | Recheck and repair recorded integrity failures |
 | `show ACCESSION` | Inspect one filing's source, extraction and history |
-| `dashboard` | Display monthly acquisition coverage |
+| `dashboard` | Display monthly download and parsing coverage |
 | `admin` | Rare setup, imports, listings, coverage detail and recovery |
 
 Main commands print readable text by default. Add `--json` for machine-readable
 output. Progress goes to stderr, leaving stdout suitable for JSON pipelines.
 `show --details` exposes all extracted tables and preserved XML/header evidence;
 `show --json` always includes that complete representation. `--result-id` selects
-a retained extraction revision. The dashboard remains an acquisition view, not
-proof that data has been parsed or checked.
+a retained extraction revision. The dashboard shows acquisition and current
+extraction coverage; integrity verification remains a separate CLI operation.
+
+The dashboard opens on the current year. Select **2016 onward** or **Full
+history** (July 2003 onward) for broader coverage. Download and parsing strips
+share the same months and scroll position; left/right arrows explore months,
+and up/down arrows switch strips. Parsing height represents downloaded filings.
+Its segments distinguish completed extractions, extracted cases needing review,
+failed/unsupported attempts, recorded in-progress work and waiting files.
+The summary cards show totals across every month in the selected range: extracted
+count and percentage of downloads, completed without issues, completed with
+warnings, needs review, not yet extracted, failed/unsupported, in progress and
+waiting. An aggregate progress bar and downloaded/indexed totals provide context.
+Hovering or focusing a month changes only its tooltip; the range totals stay fixed.
+Changing the coverage period recalculates the totals.
+
+Only selected extractions matching the registered ZIP and current or explicitly
+compatible parser count. Unaffected ownership-1/2 results remain compatible with
+v3; old date/plan-warning or missing-code review cases need an upgrade. Other
+source/parser versions remain in the backlog; an older failure does not
+override a selected current extraction. Interrupted work is waiting, and running
+counts describe recorded attempts, which may need `admin recover` after a crash.
+Counts deduplicate each accession per month across indexed entities and sources.
+They use current index associations, so retained removed filings remain available
+through the CLI. Parsing completeness is relative to downloaded files, independently
+of whether the SEC index is complete.
+
+The current-year and 2016 views check for updates every 30 seconds,
+and full history every 60 seconds while visible. Results are shared in a bounded
+server cache so multiple tabs do not multiply database scans. All queries use a
+read-only, repeatable-read snapshot, bounded transaction-local working memory,
+and a 60-second statement timeout; PostgreSQL defaults and writer settings are
+unchanged. **Data refreshed** names the snapshot time, including cached results.
+Restart only the dashboard process after updating; no schema migration is needed.
 
 ## Selection, previews and retries
 
@@ -73,16 +105,74 @@ Unsupported XML may need a parser update rather than another retry. `parse`
 does not silently replace an extraction because it has warnings. Amendments
 remain separate filings, and transactions are not multiplied by joint owners.
 
-`parse --workers 1..20` defaults to four local preparation threads. They verify
-archives, preserve durable source snapshots and extract XML while the coordinator
-publishes the preceding group. Only the coordinator accesses PostgreSQL.
-Preparation queues at most two groups, each capped at 32 filings and 8 MiB of
+`parse --workers 1..20` defaults to four local preparation workers. They verify
+archives, preserve durable source snapshots and extract XML without database
+access. `--executor auto` uses spawned processes for at least 4,096 queued filings,
+threads for smaller runs, and serial preparation for `--workers 1`. Process workers
+prepare chunks of up to 16 filings per IPC message, rather than sending one
+message per filing; the existing 64-filing/8-MiB publication bounds still apply.
+This uses multiple CPU cores without sharing database connections or locks with
+children. `--executor thread|process` explicitly selects a preparation mode.
+
+When `--write-workers` is omitted, runs with at least 4,096 queued filings and
+more than one preparation worker use **two database publishers**. Smaller runs
+and serial preparation use one. Thus the measured fast combination is automatic:
+
+```powershell
+insider parse --start 2020-01-01
+```
+
+`--dry-run` reports the resolved executor, preparation workers and database
+publishers using the same policy as execution, after applying `--limit`.
+Explicit options always override their corresponding defaults:
+
+```powershell
+insider parse --start 2020-01-01 --executor thread --write-workers 1
+```
+
+`--write-workers 1..4` selects independent connections that publish separate
+atomic batches concurrently. Four preparation workers remain the default;
+benchmark the filing mix before increasing writer concurrency beyond two.
+
+Process children ignore Ctrl+C; the coordinator stops scheduling and performs
+receipt reconciliation while holding the publisher locks. Worker failure leaves
+unpublished attempts resumable. `--executor thread` is the supported fallback.
+Python callers using process or auto mode should invoke the parser under an
+`if __name__ == "__main__":` guard; the CLI entrypoint already does so.
+
+The coordinator retains both publisher locks until all internal writers finish,
+so other discovery/download/check/repair commands remain excluded. At most
+`write-workers + 1` groups are retained, each capped at 64 filings and 8 MiB of
 recorded source text (a larger individual filing forms a one-filing group).
-The coordinator uses bulk `COPY` for larger typed/evidence tables and commits
-each group atomically, including selections and per-filing attempt receipts.
-Progress counts committed filings; Ctrl+C retains completed groups and makes
-unfinished attempts eligible on the next run. No schema or parser-version
-upgrade is required: extracted values and evidence have unchanged semantics.
+Publishers use bulk `COPY` for larger typed/evidence tables. Each group's data,
+selection and attempt receipts commit atomically; no connection/transaction is
+shared across publisher threads. Evidence rows are streamed with their result
+identifiers, SQL templates are cached without row values, and empty JSON objects
+reuse an exact serialization. Text COPY, column types, constraints, source
+snapshots and durable commit settings are retained.
+
+Progress counts only confirmed commits. Ctrl+C stops scheduling, cancels queued
+writes, waits for running transactions and counts any batches committed during
+the drain. Only then are remaining attempts marked interrupted and the publisher
+locks released. A failed batch rolls back without discarding successful sibling
+batches. Rerun the same command to resume. These changes require no schema or
+parser-semantics upgrade.
+
+To apply current parser corrections only to affected published older results,
+without starting the unparsed backlog:
+
+```powershell
+insider parse --upgrade-only --dry-run
+insider parse --upgrade-only
+```
+
+Unaffected v1/v2 results remain compatible and are skipped. Affected results get
+new revisions linked to their predecessors; historical results and source
+snapshots remain intact. The upgrade can be resumed with the same command.
+Ownership-3 treats an omitted optional transaction-coding block as a source-data
+warning, preserving NULL codes; a supplied coding block missing its required
+code still needs review. It does not infer transaction codes or repair conflicting
+source dates.
 
 For the downloaded 2016-onward collection, use:
 
@@ -242,3 +332,13 @@ public interface and accept `--json`. Administration is available as
 
 This is extraction and validation infrastructure only. Feature generation,
 market data, statistical tests, models and scheduling are outside this pipeline.
+
+
+Download and parse commands may run concurrently. Each holds a shared PostgreSQL
+maintenance gate and its own exclusive local/database lane lock; a second command
+in the same lane is rejected. Discovery, check, repair, recover and initialization
+retain the exclusive gate and cannot overlap either command. Terminating a process
+releases its locks; recover can mark abandoned attempts only after active publishers
+have exited. Parsing freezes eligible committed submission identities at run start
+in a temporary database table; later downloads are eligible on the next parse run.
+Archives are validated and atomically published before their database registration.

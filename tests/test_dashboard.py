@@ -7,6 +7,7 @@ import urllib.request
 from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from insider_research.catalog import Catalog
 from insider_research.config import Config
@@ -14,6 +15,10 @@ from insider_research.dashboard import Dashboard, HISTORY_START, make_server, mo
 from insider_research.discovery import discover
 from insider_research.http import Response
 from insider_research.sources.indexes import source_for
+from insider_research.submissions import _publish_zip
+from insider_research.ownership_store import parse_ownership
+from insider_research.ownership import PARSER_VERSION
+from tests.test_ownership import FORM4, source as filing_source
 from tests.helpers import HEADER, postgres_config, record
 
 
@@ -65,6 +70,99 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(january([], [source(period="2025-01-02", kind="daily")])["state"], "empty")
         self.assertEqual(january([], [source(observed="2024-12-31")])["state"], "unindexed")
 
+    def test_parsing_denominator_and_disjoint_states(self):
+        row = dict(month='2025-01', indexed=12, downloaded=10, parsed=5,
+                   with_warnings=1, needs_review=2, failed=1, unsupported=1, running=1)
+        month = january([row], [])
+        p = month['parsing']
+        self.assertIsNone(month['expected'])
+        self.assertEqual((p['parsed'], p['completed'], p['remaining'], p['pending']), (5, 3, 5, 2))
+        self.assertEqual(p['state'], 'attention')
+        self.assertEqual(p['completed']+p['needs_review']+p['failed']+p['unsupported']+p['running']+p['pending'], 10)
+        row.update(downloaded=5, failed=0, unsupported=0, running=0)
+        self.assertEqual(january([row], [])['parsing']['state'], 'review')
+        row['needs_review'] = 0
+        self.assertEqual(january([row], [])['parsing']['state'], 'complete')
+        self.assertEqual(january([], [])['parsing']['state'], 'unavailable')
+
+    def test_cache_shares_reads_and_does_not_cache_errors(self):
+        app = Dashboard(Config(data_root=Path('dashboard-test')))
+        start = date(datetime.now(ZoneInfo('America/New_York')).year, 1, 1)
+        with patch.object(app, '_read_coverage', side_effect=[{'months': []}, {'months': [1]}, ValueError('unavailable'), {'months': [2]}]) as read:
+            with patch('insider_research.dashboard.time.monotonic', return_value=100):
+                self.assertEqual(app.coverage(start=start), app.coverage(start=start))
+                self.assertEqual(read.call_count, 1)
+            with patch('insider_research.dashboard.time.monotonic', return_value=131):
+                self.assertEqual(app.coverage(start=start), {'months': [1]})
+            with patch('insider_research.dashboard.time.monotonic', return_value=162):
+                with self.assertRaises(ValueError):
+                    app.coverage(start=start)
+                self.assertEqual(app.coverage(start=start), {'months': [2]})
+
+    def test_month_range_and_validation(self):
+        months = monthly_coverage([], [], today=date(2026,10,28), start=date(2026,1,1))
+        self.assertEqual((len(months), months[0]['month'], months[-1]['month']), (10, '2026-01', '2026-10'))
+        app = Dashboard(Config(data_root=Path('dashboard-test')))
+        for start in (date(2000,1,1), date(2026,1,2), date(9999,1,1)):
+            with self.subTest(start=start), self.assertRaises(ValueError):
+                app.coverage(start=start)
+
+    def test_database_parsing_counts_current_sources_versions_and_latest_attempts(self):
+        with tempfile.TemporaryDirectory() as temp, postgres_config(Path(temp)/'data') as cfg:
+            Catalog.initialize(cfg)
+            accessions = [f'0000001750-26-{800000+i:06d}' for i in range(9)]
+            body = HEADER + b''.join(record(accession=a, filed='2026-01-06') for a in accessions)
+            body += record(accession=accessions[0], cik='456', filed='2026-01-06')
+            class Client:
+                def get(self, _):
+                    return Response(body, {'status': 200})
+            discover(cfg, [source_for('quarterly', '2026Q1'), source_for('daily', '2026-01-06')], client=Client())
+            for i, accession in enumerate(accessions[:8]):
+                text = filing_source().replace(FORM4.encode(), accession.encode())
+                # A real source discrepancy, independent of the retired
+                # checkbox/keyword heuristic, still counts as a warning.
+                text = text.replace(b'<periodOfReport>2026-01-02', b'<periodOfReport>2026-01-01')
+                if i == 2:
+                    text = text.replace(b'</ownershipDocument>', b'<newField>review</newField></ownershipDocument>')
+                elif i == 3:
+                    text = text.replace(b'</issuer>', b'</invalid>')
+                elif i == 4:
+                    text = text.replace(b'ownershipDocument', b'unsupportedDocument')
+                digest, relative, size, source_size = _publish_zip(cfg, accession, text)
+                with Catalog(cfg) as cat:
+                    run = cat.start_run('fixture', cfg)
+                    attempt = cat.begin_submission_attempt(run, accession)
+                    cat.register_submission(accession, relative, digest, size, source_size, 'https://www.sec.gov/fixture', attempt)
+                    cat.finish_run(run, 'succeeded', {})
+                if i < 5:
+                    parse_ownership(cfg, accession=accession, workers=1)
+            with Catalog(cfg) as cat:
+                run = cat.start_run('fixture', cfg)
+                for i, state in ((6, 'running'), (7, 'interrupted')):
+                    cat.connection.execute('''INSERT INTO parse_attempts
+                        (run_id,accession,source_sha256,parser_version,started_at,status)
+                        SELECT %s,accession,sha256,%s,now(),%s FROM submissions WHERE accession=%s''',
+                        (run, PARSER_VERSION, state, accessions[i]))
+                # An unsuccessful later attempt must not hide a selected current extraction.
+                cat.connection.execute('''INSERT INTO parse_attempts
+                    (run_id,accession,source_sha256,parser_version,started_at,status)
+                    SELECT %s,accession,sha256,%s,now(),'failed' FROM submissions WHERE accession=%s''',
+                    (run, PARSER_VERSION, accessions[0]))
+            coverage = Dashboard(cfg).coverage()
+            month = next(m for m in coverage['months'] if m['month'] == '2026-01')
+            self.assertEqual((month['indexed'], month['downloaded']), (9, 8))
+            p = month['parsing']
+            self.assertEqual((p['parsed'], p['with_warnings'], p['needs_review']), (3, 2, 1))
+            self.assertEqual((p['failed'], p['unsupported'], p['running'], p['pending'], p['remaining']), (1, 1, 1, 2, 5))
+            self.assertIsNotNone(coverage['last_parsed'])
+            with patch('insider_research.dashboard.PARSER_VERSION', 'future-parser'):
+                stale = next(m for m in Dashboard(cfg).coverage()['months'] if m['month'] == '2026-01')['parsing']
+            self.assertEqual((stale['parsed'], stale['failed'], stale['running'], stale['pending']), (0, 0, 0, 8))
+            with Catalog(cfg) as cat:
+                cat.connection.execute('UPDATE submissions SET sha256=%s WHERE accession=%s', ('b'*64, accessions[1]))
+            changed = next(m for m in Dashboard(cfg).coverage()['months'] if m['month'] == '2026-01')['parsing']
+            self.assertEqual((changed['parsed'], changed['with_warnings'], changed['pending']), (2, 1, 3))
+
     def test_http_is_read_only_and_rejects_wrong_hosts(self):
         server = make_server(Config(data_root=Path("dashboard-test")), port=0)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -78,10 +176,15 @@ class DashboardTests(unittest.TestCase):
             with patch.object(server.app, "coverage", return_value={"months": []}):
                 with urllib.request.urlopen(base + "/api/coverage") as response:
                     self.assertEqual(json.load(response), {"months": []})
+                with urllib.request.urlopen(base + '/api/coverage?start=2026-01-01') as response:
+                    self.assertEqual(json.load(response), {'months': []})
             for request, status in (
                 (urllib.request.Request(base, headers={"Host": "example.com"}), 403),
                 (urllib.request.Request(base + "/api/jobs", data=b"{}"), 405),
                 (urllib.request.Request(base + "/api/filings"), 404),
+                (urllib.request.Request(base + '/api/coverage?start=invalid'), 400),
+                (urllib.request.Request(base + '/api/coverage?start=2026-01-02'), 400),
+                (urllib.request.Request(base + '/api/coverage?start=2026-01-01&start=2026-02-01'), 400),
             ):
                 with self.assertRaises(urllib.error.HTTPError) as raised:
                     urllib.request.urlopen(request)

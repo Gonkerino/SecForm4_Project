@@ -182,7 +182,7 @@ def download_submissions(cfg: Config, *, start=RESEARCH_START, end=None, form=No
     selected_accession = accession
     summary = {"submissions_requested": 0, "submissions_downloaded": 0,
                "submissions_failed": 0, "errors": []}
-    with Catalog(cfg) as catalog, publisher_lock(cfg.data_root, catalog):
+    with Catalog(cfg) as catalog, publisher_lock(cfg.data_root, catalog, lane="download"):
         counts = catalog.submission_counts(start=start.isoformat() if start else None,
             end=end.isoformat() if end else None, form=form, accession=selected_accession)
         selection = dict(start=start.isoformat() if start else None,

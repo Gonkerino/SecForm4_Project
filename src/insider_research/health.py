@@ -27,7 +27,7 @@ from .coverage import SOURCE_COVERAGE_SQL, coverage_counts
 from .discovery import atomic_write
 from .http import FetchError, HttpClient
 from .locking import publisher_lock
-from .ownership import PARSER_VERSION, parse_submission
+from .ownership import PARSER_VERSION, SUPPORTED_PARSER_VERSIONS, parse_submission
 from .ownership_store import (_safe_path, _selection, publish, read_archive,
                               validate_result, parsing_status, inspect_ownership)
 from .sources.indexes import parse_master_index, source_for
@@ -495,7 +495,7 @@ def repair(cfg, *, stage=None, accession=None, limit=100, dry_run=False, offline
                     messages = verify(cfg, cat, selected, row)
                     if messages:
                         if selected == 'parse':
-                            if row['parser_version'] != PARSER_VERSION:
+                            if row['parser_version'] not in SUPPORTED_PARSER_VERSIONS:
                                 raise ValueError('Use parse to upgrade this extraction to the current parser')
                             body, archive = _repair_source_snapshot(cfg, cat, row, client, offline)
                             if hashlib.sha256(body).hexdigest() != row['source_text_sha256']:

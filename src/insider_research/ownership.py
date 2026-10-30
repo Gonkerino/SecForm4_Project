@@ -16,7 +16,9 @@ from zoneinfo import ZoneInfo
 
 from .config import FORMS
 
-PARSER_VERSION = "ownership-1"
+PARSER_VERSION = "ownership-3"
+LEGACY_PARSER_VERSION = "ownership-1"
+SUPPORTED_PARSER_VERSIONS = (LEGACY_PARSER_VERSION, "ownership-2", PARSER_VERSION)
 MAX_NODES = 100000
 MAX_DEPTH = 64
 
@@ -122,8 +124,32 @@ def _text(element):
     return "".join(element.itertext()) if element is not None else None
 
 
-def parse_submission(body: bytes, accession: str) -> Extraction:
+def current_result_sql(parser_version):
+    """Older results remain current unless a later fix affects their issues.
+
+    The caller binds its current parser version to the single placeholder. Keep
+    unknown/future versions strict: compatibility is specific to each revision.
+    """
+    if parser_version not in ("ownership-2", "ownership-3"):
+        return "r.parser_version=%s"
+    if parser_version == "ownership-3":
+        return """(r.parser_version=%s OR (r.parser_version IN ('ownership-1','ownership-2') AND NOT EXISTS(
+            SELECT 1 FROM parse_issues legacy_issue WHERE legacy_issue.result_id=r.id AND (
+                (r.parser_version='ownership-1' AND (legacy_issue.code='plan_evidence_conflict' OR
+                    (legacy_issue.code='invalid_scalar' AND legacy_issue.message LIKE 'Invalid date representation:%%')))
+                OR (legacy_issue.code='missing_transaction_field' AND legacy_issue.message='Missing transactionCoding/transactionCode')))))"""
+    return """(r.parser_version=%s OR (r.parser_version='ownership-1' AND NOT EXISTS(
+        SELECT 1 FROM parse_issues legacy_issue WHERE legacy_issue.result_id=r.id
+        AND (legacy_issue.code='plan_evidence_conflict' OR
+            (legacy_issue.code='invalid_scalar' AND legacy_issue.message LIKE 'Invalid date representation:%%')))))"""
+
+
+def parse_submission(body: bytes, accession: str, *, parser_version=None) -> Extraction:
     """Extract one original SGML submission. No I/O or database access."""
+    parser_version = parser_version or PARSER_VERSION
+    if parser_version not in SUPPORTED_PARSER_VERSIONS:
+        raise ValueError("Unsupported parser version for replay")
+    legacy = parser_version == LEGACY_PARSER_VERSION
     if len(body) > 128 * 1024 * 1024:
         raise ValueError("Submission exceeds parser size limit")
     if not body.rstrip().upper().endswith(b"</SEC-DOCUMENT>"):
@@ -306,9 +332,13 @@ def parse_submission(body: bytes, accession: str) -> Extraction:
             return None
         try:
             if kind == "date":
-                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                pattern = (r"[0-9]{4}-[0-9]{2}-[0-9]{2}" if legacy else
+                    r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:Z|[+-](?:0[0-9]|1[0-3]):[0-5][0-9]|[+-]14:00)?")
+                if not re.fullmatch(pattern, value):
                     raise ValueError()
-                return date.fromisoformat(value)
+                # An XML date is a calendar date, not an instant to shift to
+                # UTC. The full original representation stays in fields.
+                return date.fromisoformat(value[:10])
             if kind == "numeric":
                 if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", value) or len(value) > 1000:
                     raise ValueError()
@@ -377,7 +407,16 @@ def parse_submission(body: bytes, accession: str) -> Extraction:
                     for required in ("transactionDate", "transactionCoding/transactionCode",
                                      "transactionAmounts/transactionAcquiredDisposedCode"):
                         if not find_all(node, required):
-                            result.issue("missing_transaction_field", row["source_path"], f"Missing {required}", "review")
+                            if (parser_version == 'ownership-3' and required == 'transactionCoding/transactionCode'
+                                    and not find_all(node, 'transactionCoding')):
+                                # The SEC 4/4A/5/5A schemas make the entire
+                                # coding block optional, but require its code
+                                # when the block is supplied. Preserve NULL;
+                                # never infer a code from amounts or prose.
+                                result.issue('unreported_transaction_code', row['source_path'],
+                                    'Optional transactionCoding block omitted; transaction code not reported')
+                            else:
+                                result.issue("missing_transaction_field", row["source_path"], f"Missing {required}", "review")
                 if row.get("transaction_timeliness") not in (None, "E", "L"):
                     result.issue("unknown_timeliness", row["source_path"], "Unexpected timeliness code", "review")
     for container in find_all(root, "footnotes"):
@@ -439,6 +478,8 @@ def parse_submission(body: bytes, accession: str) -> Extraction:
         result.issue("conflicting_no_securities", "noSecuritiesOwned", "Flag conflicts with reported rows")
     if result.report["form_type"] in ("3", "3/A") and result.transactions:
         result.issue("form3_transactions", "documentType", "Form 3 unexpectedly contains transaction rows", "review")
-    if result.report["aff10b5_one"] is False and any(re.search(r"10b5[\s-]*1", n["text"] or "", re.I) for n in result.footnotes):
+    # Retain historical replay, but do not infer a conflict from a keyword:
+    # negations, amendments and sell-to-cover explanations also mention plans.
+    if legacy and result.report["aff10b5_one"] is False and any(re.search(r"10b5[\s-]*1", n["text"] or "", re.I) for n in result.footnotes):
         result.issue("plan_evidence_conflict", "aff10b5One", "False indicator with 10b5-1 footnote; both preserved")
     return result

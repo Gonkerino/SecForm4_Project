@@ -4,18 +4,26 @@ from __future__ import annotations
 import hashlib
 import io
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import uuid
 import zipfile
 import zlib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing
+import signal
+from collections import deque
+from functools import lru_cache
+from operator import itemgetter
+from typing import NamedTuple
+from threading import Lock, local
 
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from .catalog import Catalog, utc_now
 from .locking import publisher_lock
-from .ownership import PARSER_VERSION, UnsupportedSubmission, parse_submission
+from .ownership import (PARSER_VERSION, SUPPORTED_PARSER_VERSIONS, UnsupportedSubmission,
+                        parse_submission, current_result_sql)
 
 TABLES = {
     "header_fields": "submission_header_fields",
@@ -26,14 +34,36 @@ TABLES = {
     "issues": "parse_issues",
 }
 JSON_COLUMNS = {"attributes", "counts_json"}
-PARSE_BATCH_SIZE = 32
+PARSE_BATCH_SIZE = 64
 PARSE_BATCH_BYTES = 8 * 1024 * 1024
+PARSE_PROCESS_THRESHOLD = 4096
+PARSE_PROCESS_CHUNK = 16
 CONTENT_ERRORS = (ValueError, OSError, zipfile.BadZipFile, EOFError, RuntimeError, zlib.error)
+_EMPTY_JSONB = Jsonb({}, dumps=lambda value: b'{}')
+
+
+class _ResultGroup(NamedTuple):
+    result_id: int
+    rows: list[dict]
+
+
+def _comparison_path(path):
+    # Windows resolve() can return either D:\... or \\?\D:\...,
+    # especially while a new snapshot directory is being created. They name
+    # the same location; normalize only the containment comparison, retaining
+    # the resolved path for I/O and long-path support.
+    if isinstance(path, PureWindowsPath):
+        value = str(path)
+        if value.startswith('\\\\?\\UNC\\'):
+            return PureWindowsPath('\\\\' + value[8:])
+        if value.startswith('\\\\?\\'):
+            return PureWindowsPath(value[4:])
+    return path
 
 
 def _safe_path(root, relative):
     path = (root / relative).resolve()
-    if not path.is_relative_to(root.resolve()):
+    if not _comparison_path(path).is_relative_to(_comparison_path(root.resolve())):
         raise ValueError("Archive path escapes data root")
     return path
 
@@ -98,21 +128,51 @@ def _snapshot(cfg, digest, archive_bytes):
     return relative
 
 
+@lru_cache(maxsize=256)
+def _insert_statement(table, keys, bulk):
+    columns = sql.SQL(',').join(map(sql.Identifier, keys))
+    if bulk:
+        return sql.SQL('COPY {} ({}) FROM STDIN').format(sql.Identifier(table), columns)
+    return sql.SQL('INSERT INTO {} ({}) VALUES ({})').format(
+        sql.Identifier(table), columns, sql.SQL(',').join(sql.Placeholder() for _ in keys))
+
+
+def _row_values(keys, rows):
+    """Read fields in explicit column order without per-field Python tests."""
+    getter = itemgetter(*keys)
+    values = map(getter, rows) if len(keys) > 1 else ((getter(row),) for row in rows)
+    json_positions = [i for i, key in enumerate(keys) if key in JSON_COLUMNS]
+    if not json_positions:
+        yield from values
+        return
+    for row in values:
+        row = list(row)
+        for position in json_positions:
+            value = row[position]
+            row[position] = _EMPTY_JSONB if value == {} else Jsonb(value)
+        yield row
+
+
 def _insert(connection, table, rows):
     if not rows:
         return
-    keys = list(rows[0])
-    query = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
-        sql.Identifier(table), sql.SQL(",").join(map(sql.Identifier, keys)),
-        sql.SQL(",").join(sql.Placeholder() for _ in keys))
+    if isinstance(rows[0], _ResultGroup):
+        source_keys = tuple(rows[0].rows[0])
+        keys = ('result_id', *source_keys)
+        count = sum(len(group.rows) for group in rows)
+        # Prefix an ID as values are written; do not duplicate every evidence
+        # dictionary merely to add the same result_id to all of its rows.
+        values = ((group.result_id, *values) for group in rows
+                  for values in _row_values(source_keys, group.rows))
+    else:
+        keys = tuple(rows[0])
+        count = len(rows)
+        values = _row_values(keys, rows)
     with connection.cursor() as cursor:
-        values = ([Jsonb(row[k]) if k in JSON_COLUMNS else row[k] for k in keys] for row in rows)
-        if len(rows) < 8:
-            cursor.executemany(query, values)
+        if count < 8:
+            cursor.executemany(_insert_statement(table, keys, False), values)
         else:
-            copy = sql.SQL("COPY {} ({}) FROM STDIN").format(
-                sql.Identifier(table), sql.SQL(",").join(map(sql.Identifier, keys)))
-            with cursor.copy(copy) as writer:
+            with cursor.copy(_insert_statement(table, keys, True)) as writer:
                 for values_row in values:
                     writer.write_row(values_row)
 
@@ -149,7 +209,7 @@ def publish(catalog, row, attempt_id, extracted, snapshot_path, source_hash):
 
 
 def _prepare(cfg, row):
-    """Workers touch source files only; PostgreSQL stays on the coordinator."""
+    """Preparation workers touch source files only, never PostgreSQL."""
     prepared = dict(row=row, snapshot_path=None, source_hash=None, extracted=None, message=None)
     try:
         body, archive_bytes = read_archive(cfg, row)
@@ -162,6 +222,37 @@ def _prepare(cfg, row):
     return prepared
 
 
+def _initialize_parse_process():
+    # Only the coordinator handles Ctrl+C and reconciles durable receipts.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def _prepare_chunk(cfg, rows):
+    """One IPC round-trip per small group, with no child database access."""
+    return [_prepare(cfg, row) for row in rows]
+
+
+def _preparation_mode(executor, workers, total):
+    if workers == 1:
+        return 'serial'
+    if executor == 'process' or (executor == 'auto' and total >= PARSE_PROCESS_THRESHOLD):
+        return 'process'
+    return 'thread'
+
+
+def parsing_execution(*, total, workers=4, write_workers=None, executor='auto'):
+    """Resolve the same bounded defaults for previews and actual execution."""
+    if not 1 <= workers <= 20:
+        raise ValueError('Workers must be between 1 and 20')
+    if write_workers is not None and not 1 <= write_workers <= 4:
+        raise ValueError('Write workers must be between 1 and 4')
+    if executor not in ('auto', 'thread', 'process'):
+        raise ValueError('Executor must be auto, thread or process')
+    if write_workers is None:
+        write_workers = 2 if workers > 1 and total >= PARSE_PROCESS_THRESHOLD else 1
+    return dict(executor=_preparation_mode(executor, workers, total), workers=workers, write_workers=write_workers)
+
+
 def _publish_batch(catalog, prepared):
     """Publish a bounded group atomically, retaining every per-filing receipt."""
     connection = catalog.connection
@@ -171,28 +262,29 @@ def _publish_batch(catalog, prepared):
             metadata = [dict(accession=p['row']['accession'], attempt_id=p['attempt_id'],
                 source_sha256=p['row']['sha256'], source_text_sha256=p['source_hash'],
                 source_snapshot_path=p['snapshot_path'], status=p['status'],
-                counts_json=_counts(p['extracted'])) for p in successful]
+                counts_json=_counts(p['extracted']),
+                supersedes_result_id=p['row'].get('previous_result_id')) for p in successful]
             result_ids = {r['accession']: r['id'] for r in connection.execute('''INSERT INTO parse_results
                 (accession,attempt_id,source_sha256,source_text_sha256,source_snapshot_path,
-                 parser_version,parsed_at,status,counts_json)
+                 parser_version,parsed_at,status,counts_json,supersedes_result_id)
                 SELECT accession,attempt_id,source_sha256,source_text_sha256,source_snapshot_path,
-                       %s,now(),status,counts_json
+                       %s,now(),status,counts_json,supersedes_result_id
                 FROM jsonb_to_recordset(%s) AS t(accession text,attempt_id bigint,
                     source_sha256 text,source_text_sha256 text,source_snapshot_path text,
-                    status text,counts_json jsonb) RETURNING accession,id''', (PARSER_VERSION, Jsonb(metadata)))}
+                    status text,counts_json jsonb,supersedes_result_id bigint) RETURNING accession,id''', (PARSER_VERSION, Jsonb(metadata)))}
             tables = {'submission_headers': [], 'submission_documents': [], 'ownership_reports': [],
                       **{table: [] for table in TABLES.values()}}
             for p in successful:
                 result_id = result_ids[p['row']['accession']]
                 extracted = p['extracted']
-                tables['submission_headers'].append(dict(result_id=result_id, **extracted.header))
-                tables['ownership_reports'].append(dict(result_id=result_id, **extracted.report))
+                tables['submission_headers'].append(_ResultGroup(result_id, [extracted.header]))
+                tables['ownership_reports'].append(_ResultGroup(result_id, [extracted.report]))
                 for name, table in TABLES.items():
-                    for number, row in enumerate(getattr(extracted, name), 1):
-                        values = dict(result_id=result_id, **row)
-                        if name == 'issues':
-                            values['issue_number'] = number
-                        tables[table].append(values)
+                    rows = getattr(extracted, name)
+                    if name == 'issues':
+                        rows = [dict(issue_number=number, **row) for number, row in enumerate(rows, 1)]
+                    if rows:
+                        tables[table].append(_ResultGroup(result_id, rows))
             # Header/document/report order satisfies the ownership foreign keys.
             for table, rows in tables.items():
                 _insert(connection, table, rows)
@@ -207,10 +299,16 @@ def _publish_batch(catalog, prepared):
             WHERE p.id=t.id''', (Jsonb(receipts),))
 
 
-def _selection(start=None, end=None, form=None, accession=None, *, accession_after=None):
+def _selection(start=None, end=None, form=None, accession=None, *, accession_after=None, upgrade_only=False):
     if start and end and start > end:
         raise ValueError("Start date must be on or before end date")
     parts, params = [], []
+    if upgrade_only:
+        parts.append(f"""EXISTS(SELECT 1 FROM ownership_current_results upgrade_selection
+            JOIN parse_results r ON r.id=upgrade_selection.result_id
+            WHERE r.accession=s.accession AND r.source_sha256=s.sha256
+              AND r.parser_version=ANY(%s) AND NOT {current_result_sql(PARSER_VERSION)})""")
+        params.extend(([v for v in SUPPORTED_PARSER_VERSIONS if v != PARSER_VERSION], PARSER_VERSION))
     if accession:
         parts.append("s.accession=%s")
         params.append(accession)
@@ -236,8 +334,8 @@ def _selection(start=None, end=None, form=None, accession=None, *, accession_aft
 
 
 def _eligibility(retry_failed):
-    where = """NOT EXISTS(SELECT 1 FROM parse_results r JOIN ownership_current_results c ON c.result_id=r.id WHERE r.accession=s.accession
-        AND r.source_sha256=s.sha256 AND r.parser_version=%s)"""
+    where = f"""NOT EXISTS(SELECT 1 FROM parse_results r JOIN ownership_current_results c ON c.result_id=r.id WHERE r.accession=s.accession
+        AND r.source_sha256=s.sha256 AND {current_result_sql(PARSER_VERSION)})"""
     if not retry_failed:
         where += """ AND NOT EXISTS(SELECT 1 FROM parse_attempts p WHERE p.id=(
             SELECT max(p2.id) FROM parse_attempts p2 WHERE p2.accession=s.accession
@@ -253,43 +351,90 @@ def plan_parse(cfg, *, retry_failed=False, **filters):
         row = catalog.connection.execute(f"""SELECT count(*) AS downloaded_selected,
             count(*) FILTER(WHERE {eligible}) AS eligible,
             count(*) FILTER(WHERE EXISTS(SELECT 1 FROM parse_results r JOIN ownership_current_results c ON c.result_id=r.id WHERE r.accession=s.accession
-                AND r.source_sha256=s.sha256 AND r.parser_version=%s)) AS already_extracted
+                AND r.source_sha256=s.sha256 AND {current_result_sql(PARSER_VERSION)})) AS already_extracted
             FROM submissions s WHERE {where}""", [*versions, PARSER_VERSION, *params]).fetchone()
     return dict(row, parser_version=PARSER_VERSION, previous_failures_excluded=row["downloaded_selected"] - row["eligible"] - row["already_extracted"],
                 note="Local archives only. Date/form filters use historical index observations. No default date cutoff.")
 
 
-def parse_ownership(cfg, *, limit=None, retry_failed=False, progress=None, workers=4, **filters):
+def parse_ownership(cfg, *, limit=None, retry_failed=False, progress=None, workers=4, write_workers=None, executor='auto', **filters):
     if limit is not None and not 1 <= limit <= 10000:
         raise ValueError("Limit must be between 1 and 10000")
-    if not 1 <= workers <= 20:
-        raise ValueError("Workers must be between 1 and 20")
+    parsing_execution(total=0, workers=workers, write_workers=write_workers, executor=executor)
     where, params = _selection(**filters)
     eligible, versions = _eligibility(retry_failed)
     summary = dict(parser_version=PARSER_VERSION, processed=0, complete=0, complete_with_warnings=0,
-                   needs_review=0, unsupported=0, failed=0, errors=[])
-    with Catalog(cfg) as catalog, publisher_lock(cfg.data_root, catalog):
-        # Lock excludes acquisition/publication changes while the keyset pages run.
-        eligible_count = catalog.connection.execute(f"SELECT count(*) AS n FROM submissions s WHERE {where} AND {eligible}",
-                                                  [*params, *versions]).fetchone()["n"]
+                   needs_review=0, unsupported=0, failed=0, errors=[], upgrade_only=bool(filters.get('upgrade_only')),
+                   write_workers=write_workers)
+    with Catalog(cfg) as catalog, publisher_lock(cfg.data_root, catalog, lane="parse"):
+        # Freeze this run's queue in PostgreSQL without retaining all identities
+        # in Python. Downloads committed later are picked up by the next run.
+        catalog.connection.execute(f"""CREATE TEMP TABLE parse_queue ON COMMIT PRESERVE ROWS AS
+            SELECT s.accession FROM submissions s WHERE {where} AND {eligible}""",
+            [*params, *versions])
+        catalog.connection.execute("CREATE UNIQUE INDEX ON parse_queue(accession)")
+        catalog.connection.execute("ANALYZE pg_temp.parse_queue")
+        eligible_count = catalog.connection.execute("SELECT count(*) AS n FROM parse_queue").fetchone()["n"]
         total = min(eligible_count, limit) if limit is not None else eligible_count
+        execution = parsing_execution(total=total, workers=workers, write_workers=write_workers, executor=executor)
+        mode, write_workers = execution['executor'], execution['write_workers']
+        summary.update(execution)
         summary.update(eligible_before=eligible_count, queued=total)
         if progress:
             progress({"event": "start", "total": total})
         run_id = catalog.start_run("parse-ownership", cfg)
         summary["run_id"] = run_id
         after = ""
-        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='ownership') if workers > 1 else None
+        pool = None
+        # Each publisher owns a connection/transaction. The coordinator retains
+        # both publisher locks until all these writers have stopped.
+        writer_local = local()
+        writer_connections, inflight = [], deque()
+        writer_lock = Lock()
+        def initialize_writer():
+            writer_local.catalog = Catalog(cfg)
+            with writer_lock:
+                writer_connections.append(writer_local.catalog)
+        def publish_group(prepared):
+            _publish_batch(writer_local.catalog, prepared)
+        write_pool = (ThreadPoolExecutor(max_workers=write_workers, thread_name_prefix='ownership-db',
+                      initializer=initialize_writer) if write_workers > 1 else None)
         scheduled = 0
+
+        def account(prepared, *, notify=True):
+            # A future returning confirms its whole transaction has committed.
+            for p in prepared:
+                summary[p['status']] += 1
+                if p['message'] is not None and len(summary['errors']) < 100:
+                    summary['errors'].append(dict(accession=p['row']['accession'], status=p['status'], message=p['message']))
+            summary['processed'] += len(prepared)
+            if notify:
+                for p in prepared:
+                    if progress and (p is prepared[-1] or p['status'] in ('unsupported', 'failed')):
+                        progress(dict(event='progress', current=summary['processed'], accession=p['row']['accession'],
+                                      status='failed' if p['status'] in ('unsupported', 'failed') else p['status'],
+                                      message=p['message'], problems=summary['needs_review'] + summary['unsupported'] + summary['failed']))
+
+        def collect():
+            future, prepared = inflight[0]
+            future.result()
+            inflight.popleft()
+            account(prepared)
 
         def enqueue():
             nonlocal after, scheduled
             if scheduled >= total:
                 return None
-            page_where, page_params = _selection(**filters, accession_after=after)
-            rows = list(catalog.connection.execute(f"""SELECT s.* FROM submissions s
-                WHERE {page_where} AND {eligible} ORDER BY s.accession LIMIT %s""",
-                [*page_params, *versions, min(PARSE_BATCH_SIZE, total - scheduled)]))
+            # Selection/eligibility were frozen once under the parser lane lock.
+            # Bound the indexed queue page BEFORE joining submissions, so neither
+            # completed results nor the consumed queue prefix are rescanned.
+            rows = list(catalog.connection.execute("""SELECT s.*,
+                (SELECT result_id FROM ownership_current_results WHERE accession=s.accession) AS previous_result_id
+                FROM (SELECT accession FROM pg_temp.parse_queue
+                      WHERE accession>%s ORDER BY accession LIMIT %s) q
+                JOIN submissions s ON s.accession=q.accession
+                ORDER BY s.accession""",
+                [after, min(PARSE_BATCH_SIZE, total - scheduled)]))
             if not rows:
                 return None
             group, source_bytes = [], 0
@@ -309,16 +454,32 @@ def parse_ownership(cfg, *, limit=None, retry_failed=False, progress=None, worke
             for observation in catalog.connection.execute('''SELECT DISTINCT accession,form_type,filed_date
                     FROM current_associations WHERE accession=ANY(%s)''', (list(attempts),)):
                 observations.setdefault(observation['accession'], []).append(observation)
-            futures = [pool.submit(_prepare, cfg, row) for row in group] if pool else None
+            if mode == 'process':
+                futures = [pool.submit(_prepare_chunk, cfg, group[i:i+PARSE_PROCESS_CHUNK])
+                           for i in range(0, len(group), PARSE_PROCESS_CHUNK)]
+            else:
+                futures = [pool.submit(_prepare, cfg, row) for row in group] if pool else None
             scheduled += len(group)
             return group, attempts, observations, futures
 
         try:
+            if mode == 'process':
+                # Spawn explicitly: worker processes never inherit a live
+                # PostgreSQL connection, advisory lock or writer thread.
+                pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context('spawn'),
+                                           initializer=_initialize_parse_process)
+            elif mode == 'thread':
+                pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='ownership')
             pending = enqueue()
             while pending is not None:
+                if write_pool is not None and len(inflight) >= write_workers:
+                    collect()
                 group, attempts, observations, futures = pending
-                prepared = ([future.result() for future in futures] if futures is not None else
-                            [_prepare(cfg, row) for row in group])
+                if mode == 'process':
+                    prepared = [p for future in futures for p in future.result()]
+                else:
+                    prepared = ([future.result() for future in futures] if futures is not None else
+                                [_prepare(cfg, row) for row in group])
                 for p in prepared:
                     accession = p['row']['accession']
                     p['attempt_id'] = attempts[accession]
@@ -331,26 +492,57 @@ def parse_ownership(cfg, *, limit=None, retry_failed=False, progress=None, worke
                 # Overlap preparation of the next bounded group with COPY and
                 # commit of this one. Never queue the entire catalogue.
                 pending = enqueue()
-                _publish_batch(catalog, prepared)
-                # Account for the entire committed group before callbacks, which
-                # may interrupt the command after its first progress event.
-                for p in prepared:
-                    summary[p['status']] += 1
-                    if p['message'] is not None and len(summary['errors']) < 100:
-                        summary['errors'].append(dict(accession=p['row']['accession'], status=p['status'], message=p['message']))
-                summary['processed'] += len(prepared)
-                for p in prepared:
-                    if progress and (p is prepared[-1] or p['status'] in ('unsupported', 'failed')):
-                        progress(dict(event='progress', current=summary['processed'], accession=p['row']['accession'],
-                                      status='failed' if p['status'] in ('unsupported', 'failed') else p['status'],
-                                      message=p['message'], problems=summary['needs_review'] + summary['unsupported'] + summary['failed']))
+                if write_pool is None:
+                    _publish_batch(catalog, prepared)
+                    account(prepared)
+                else:
+                    inflight.append((write_pool.submit(publish_group, prepared), prepared))
+                    while inflight and inflight[0][0].done():
+                        collect()
+            while inflight:
+                collect()
         except BaseException as exc:
+            # Stop scheduling, cancel jobs that have not started, and wait for
+            # running transactions before reconciling attempts or releasing the
+            # publisher lock. Independently committed batches must be counted
+            # even if a sibling transaction or a progress callback failed.
+            if write_pool is not None:
+                for future, _ in inflight:
+                    future.cancel()
+                write_pool.shutdown(wait=True, cancel_futures=True)
+                write_pool = None
+                for future, prepared in inflight:
+                    if future.cancelled():
+                        continue
+                    try:
+                        future.result()
+                    except BaseException:
+                        continue
+                    account(prepared, notify=False)
+                inflight.clear()
             catalog.connection.execute("UPDATE parse_attempts SET status='interrupted',finished_at=%s,error=%s WHERE run_id=%s AND status='running'",
                                        (utc_now(), "Parser run interrupted", run_id))
+            # Receipts and results commit together. Reconcile from PostgreSQL
+            # in case Ctrl+C arrived between a commit and Python accounting.
+            committed = {r['status']: r['count'] for r in catalog.connection.execute('''
+                SELECT status,count(*) AS count FROM parse_attempts WHERE run_id=%s
+                AND status IN ('complete','complete_with_warnings','needs_review','failed','unsupported')
+                GROUP BY status''', (run_id,))}
+            for status in ('complete', 'complete_with_warnings', 'needs_review', 'failed', 'unsupported'):
+                summary[status] = committed.get(status, 0)
+            summary['processed'] = sum(committed.values())
+            summary['unattempted_eligible'] = eligible_count - summary['processed']
+            summary['errors'] = list(catalog.connection.execute('''SELECT accession,status,error AS message
+                FROM parse_attempts WHERE run_id=%s AND status IN ('failed','unsupported')
+                AND error IS NOT NULL ORDER BY id LIMIT 100''', (run_id,)))
             catalog.finish_run(run_id, "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", summary,
                                "Parser run interrupted" if isinstance(exc, KeyboardInterrupt) else "Parser run failed; see attempt records")
             raise
         finally:
+            if write_pool is not None:
+                write_pool.shutdown(wait=True, cancel_futures=True)
+            for writer in writer_connections:
+                writer.close()
             if pool is not None:
                 pool.shutdown(wait=True, cancel_futures=True)
         summary["unattempted_eligible"] = eligible_count - summary["processed"]
@@ -362,9 +554,9 @@ def parse_ownership(cfg, *, limit=None, retry_failed=False, progress=None, worke
 def parsing_status(cfg):
     with Catalog(cfg) as catalog, catalog.connection.transaction():
         catalog.connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        counts = catalog.connection.execute("""SELECT count(*) AS downloaded,
+        counts = catalog.connection.execute(f"""SELECT count(*) AS downloaded,
             count(*) FILTER(WHERE r.id IS NOT NULL) AS selected_extractions,
-            count(*) FILTER(WHERE r.source_sha256=s.sha256 AND r.parser_version=%s) AS current_source_and_parser,
+            count(*) FILTER(WHERE r.source_sha256=s.sha256 AND {current_result_sql(PARSER_VERSION)}) AS current_source_and_parser,
             count(*) FILTER(WHERE r.status='complete') AS complete,
             count(*) FILTER(WHERE r.status='complete_with_warnings') AS complete_with_warnings,
             count(*) FILTER(WHERE r.status='needs_review') AS needs_review
@@ -403,9 +595,9 @@ def validate_result(cfg, catalog, row):
         body, _ = read_archive(cfg, row, snapshot=True)
         if hashlib.sha256(body).hexdigest() != row["source_text_sha256"]:
             raise ValueError("Submission text checksum mismatch")
-        if row["parser_version"] != PARSER_VERSION:
+        if row["parser_version"] not in SUPPORTED_PARSER_VERSIONS:
             raise ValueError("Result uses a different parser version; source verified, replay unavailable")
-        extracted = parse_submission(body, row["accession"])
+        extracted = parse_submission(body, row["accession"], parser_version=row['parser_version'])
         if set(row["counts_json"]) != set(TABLES):
             messages.append("Result manifest does not account for every extraction table")
         for name, table in {"header": "submission_headers", "report": "ownership_reports", **TABLES}.items():

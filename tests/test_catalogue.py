@@ -192,6 +192,30 @@ class CatalogueTests(unittest.TestCase):
                     with publisher_lock(self.cfg.data_root, other):
                         pass
 
+    def test_publisher_lanes_and_maintenance_gate(self):
+        other_root = Path(self.temp.name) / "lane-lock-location"
+        (other_root / "catalog").mkdir(parents=True)
+        with Catalog(self.cfg) as download, Catalog(self.cfg) as parse, Catalog(self.cfg) as other:
+            with publisher_lock(self.cfg.data_root, download, lane="download"):
+                with publisher_lock(self.cfg.data_root, parse, lane="parse"):
+                    for lane in (None, "download", "parse"):
+                        with self.subTest(lane=lane), self.assertRaises(ValueError):
+                            with publisher_lock(other_root, other, lane=lane):
+                                self.fail("Conflicting publisher entered")
+                    with self.assertRaises(ValueError):
+                        Catalog.initialize(self.cfg)
+            # Failed acquisition released its shared gate and lane locks.
+            with publisher_lock(other_root, other):
+                for lane in ("download", "parse"):
+                    with self.assertRaises(ValueError):
+                        with publisher_lock(self.cfg.data_root, download, lane=lane):
+                            self.fail("Publisher entered during maintenance")
+            with self.assertRaises(KeyboardInterrupt):
+                with publisher_lock(self.cfg.data_root, download, lane="download"):
+                    raise KeyboardInterrupt()
+            with publisher_lock(other_root, other, lane="download"):
+                pass
+
     def test_newer_schema_refused(self):
         with Catalog(self.cfg) as cat:
             cat.connection.execute("UPDATE metadata SET value='999' WHERE key='schema_version'")

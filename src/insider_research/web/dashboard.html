@@ -4,39 +4,201 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Insider Research · Monthly coverage</title>
 <style>
-:root{font-family:Segoe UI,system-ui,sans-serif;color:#223d32;background:#f7f8f5;font-size:14px}*{box-sizing:border-box}body{margin:0}header{height:76px;background:#203e31;color:#fff;display:flex;align-items:center;padding:0 36px;font-weight:650;font-size:18px;letter-spacing:-.3px}header span{opacity:.55;margin-right:12px}main{max-width:1600px;margin:0 auto;padding:42px 24px}section{background:#fff;border:1px solid #e0e5dc;border-radius:12px;padding:26px 28px 22px}h1{font-size:19px;letter-spacing:-.4px;font-weight:600;margin:0}.topline{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:26px}.range{font-size:12px;color:#7c897f}.scroll{overflow-x:auto;padding:5px 1px 8px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:8px;gap:3px;width:max-content;min-width:100%;height:100px;align-items:end}.bar{border:0;border-radius:1px;padding:0;min-width:0;cursor:default;background:#e15d56;position:relative}.bar.unindexed{background:#bdc4c0}.bar.complete{background:#16b77f}.bar.partial{background:#e9ad43}.bar:hover,.bar:focus-visible{outline:2px solid #263e33;outline-offset:2px;z-index:1}.axis{position:relative;height:16px;margin-top:9px;width:100%;color:#8a948b;font-size:10px}.axis span{position:absolute;transform:translateX(-50%)}.axis span:first-child{transform:none}.axis span:last-child{transform:translateX(-100%)}.legend{display:flex;gap:20px;align-items:center;margin-top:16px;color:#819084;font-size:11px}.legend span{display:flex;gap:6px;align-items:center}.dot{width:6px;height:6px;border-radius:50%;background:#e15d56;display:inline-block}.dot.partial{background:linear-gradient(to top,#16b77f 50%,#e15d56 50%)}.dot.unindexed{background:#bdc4c0}.dot.complete{background:#16b77f}#tooltip{position:fixed;z-index:5;background:#203e31;color:#fff;padding:16px 18px;border-radius:9px;box-shadow:0 8px 30px #203e3129;width:265px;pointer-events:none;font-size:12px}#tooltip[hidden]{display:none}.month{font-weight:600;font-size:14px;margin-bottom:12px}.detail{display:flex;justify-content:space-between;gap:15px;margin-top:7px}.detail span:first-child{color:#b9c9bc}.tipnote{color:#b9c9bc;font-size:11px;line-height:1.5;margin-top:12px;border-top:1px solid #ffffff20;padding-top:10px}.error{color:#9a5146;font-size:12px;line-height:1.5;margin-top:14px}.error:empty{display:none}.loading{opacity:.5}button:focus-visible{outline:2px solid #263e33}@media(max-width:600px){header{height:65px;padding:0 22px}main{padding:26px 16px}section{padding:20px 18px}.topline{align-items:start;flex-direction:column;gap:7px;margin-bottom:20px}.legend{gap:13px;flex-wrap:wrap}}
-.freshness{margin-top:18px;display:flex;justify-content:space-between;gap:24px;padding:20px 28px}.freshness h2{margin:0 0 8px;font-size:12px;font-weight:500;color:#7c897f}.freshness time{font-size:14px;font-weight:550}.freshness p{margin:7px 0 0;font-size:11px;color:#7c897f}.viewFreshness{text-align:right}@media(max-width:600px){.freshness{padding:18px;flex-wrap:wrap}.viewFreshness{text-align:left}.legend{flex-wrap:wrap}}
+.controls{display:flex;align-items:center;gap:16px;flex-wrap:wrap}.controls select{font:inherit;font-size:12px;color:#223d32;background:#fafbf8;border:1px solid #dce2d9;border-radius:6px;padding:7px 10px}.controls select:disabled{opacity:.6}#loadState{min-height:17px;margin-bottom:12px}.timeline{grid-auto-columns:minmax(8px,1fr)}
+:root{font-family:Segoe UI,system-ui,sans-serif;color:#223d32;background:#f7f8f5;font-size:14px}*{box-sizing:border-box}body{margin:0}header{height:76px;background:#203e31;color:#fff;display:flex;align-items:center;padding:0 36px;font-weight:650;font-size:18px;letter-spacing:-.3px}header span{opacity:.55;margin-right:12px}main{max-width:1600px;margin:0 auto;padding:38px 24px}section{background:#fff;border:1px solid #e0e5dc;border-radius:12px;padding:26px 28px 22px}h1{font-size:19px;letter-spacing:-.4px;font-weight:600;margin:0}.topline{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:26px}.range,.caption{font-size:12px;color:#7c897f}.stage-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:15px}.stage-heading h2{margin:0;font-size:14px;font-weight:600}.stage+.stage{margin-top:28px;padding-top:24px;border-top:1px solid #e8ece5}.scroll{overflow-x:auto;padding:5px 1px 8px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:8px;gap:3px;width:max-content;min-width:100%;height:100px;align-items:end}.bar{border:0;border-radius:1px;padding:0;min-width:0;cursor:default;background:#e15d56;position:relative}.bar.unindexed{background:#bdc4c0}.bar.complete{background:#16b77f}.bar.partial{background:#e9ad43}.bar.parsing{background:#dce2dd}.bar:hover,.bar:focus-visible{outline:2px solid #263e33;outline-offset:2px;z-index:1}.axis{position:relative;height:16px;margin-top:9px;width:100%;color:#8a948b;font-size:10px}.axis span{position:absolute;transform:translateX(-50%)}.axis span:first-child{transform:none}.axis span:last-child{transform:translateX(-100%)}.legend{display:flex;gap:19px;align-items:center;flex-wrap:wrap;margin-top:15px;color:#718075;font-size:11px}.legend span{display:flex;gap:6px;align-items:center}.dot{width:7px;height:7px;border-radius:50%;background:#e15d56;display:inline-block}.dot.partial{background:linear-gradient(to top,#16b77f 50%,#e15d56 50%)}.dot.unindexed{background:#bdc4c0}.dot.complete{background:#16b77f}.dot.review{background:#e9ad43}.dot.running{background:#6485c4}.dot.pending{background:#dce2dd}.note{font-size:11px;color:#7c897f;line-height:1.6;margin:13px 0 0}.summary-heading{font-size:11px;color:#7c897f;margin:0 0 10px}.summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}.metric{border:1px solid #e8ece5;border-radius:8px;padding:12px 14px;background:#fafbf8}.metric-label{font-size:11px;color:#718075}.metric-value{font-size:22px;line-height:1.4;font-weight:600;letter-spacing:-.5px;margin-top:4px}.metric-sub{font-size:11px;color:#7c897f;min-height:16px}.metric.review .metric-value{color:#946720}.metric.failed .metric-value{color:#ac4942}#tooltip{position:fixed;z-index:5;background:#203e31;color:#fff;padding:16px 18px;border-radius:9px;box-shadow:0 8px 30px #203e3129;width:290px;pointer-events:none;font-size:12px}#tooltip[hidden]{display:none}.month{font-weight:600;font-size:14px;margin-bottom:12px}.detail{display:flex;justify-content:space-between;gap:15px;margin-top:7px}.detail span:first-child{color:#b9c9bc}.tipnote{color:#b9c9bc;font-size:11px;line-height:1.5;margin-top:12px;border-top:1px solid #ffffff20;padding-top:10px}.error{color:#9a5146;font-size:12px;line-height:1.5;margin-top:14px}.error:empty{display:none}.loading{opacity:.5}button:focus-visible{outline:2px solid #263e33}.freshness{margin-top:18px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:24px;padding:20px 28px}.freshness h2{margin:0 0 8px;font-size:12px;font-weight:500;color:#7c897f}.freshness time{font-size:14px;font-weight:550}.freshness p{margin:7px 0 0;font-size:11px;color:#7c897f}.viewFreshness{text-align:right}@media(max-width:650px){header{height:65px;padding:0 22px}main{padding:24px 16px}section{padding:20px 18px}.topline{align-items:start;flex-direction:column;gap:7px;margin-bottom:22px}.stage-heading{align-items:start;flex-direction:column;gap:5px}.summary{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.legend{gap:13px}.freshness{padding:18px;grid-template-columns:1fr;gap:18px}.viewFreshness{text-align:left}}
+.timeline{grid-auto-columns:minmax(8px,1fr)}
+.axis.month-axis span{transform:translateX(-50%)}
+.aggregate-progress{height:10px;border-radius:5px;margin:0 0 10px;background:#dce2dd}.aggregate-note{margin:0 0 18px}.metric.warning .metric-value{color:#946720}
 </style>
 </head>
 <body>
 <header><span>◈</span>Insider Research</header>
-<main><section aria-label="Monthly filing download coverage">
-<div class="topline"><h1>Monthly coverage</h1><span id="range" class="range">July 2003 — present · Forms 3, 4 & 5</span></div>
-<div class="scroll"><div id="timeline" class="timeline loading" role="group" aria-label="One bar per month; use arrow keys to explore"></div><div id="axis" class="axis" aria-hidden="true"></div></div>
-<div class="legend"><span><i class="dot unindexed"></i>Not indexed</span><span><i class="dot"></i>No files</span><span><i class="dot partial"></i>Partial</span><span><i class="dot complete"></i>Complete</span><span>Height = indexed filings</span></div>
-<div id="error" class="error" role="alert"></div>
-</section><section class="freshness" aria-label="Index freshness"><div><h2>Last indexed</h2><time id="lastIndexed">Loading…</time><p id="indexedSource"></p></div><div class="viewFreshness"><h2>View refreshed</h2><time id="viewRefreshed">Waiting for data…</time></div></section></main>
+<main>
+<section aria-label="Monthly filing download and parsing coverage">
+  <div class="topline"><h1>Monthly coverage</h1><div class="controls"><span id="range" class="range">Forms 3, 4 &amp; 5</span><select id="periodSelect" aria-label="Coverage period"><option value="year">Current year</option><option value="2016">2016 onward</option><option value="all">Full history</option></select></div></div>
+  <div id="loadState" class="caption" role="status"></div>
+  <div class="stage">
+    <div class="stage-heading"><h2>Downloads</h2><span class="caption">Height = indexed filings</span></div>
+    <div class="scroll" id="downloadScroll"><div id="timeline" class="timeline loading" role="group" aria-label="Monthly downloads; arrow keys explore months, down moves to parsing"></div><div id="axis" class="axis" aria-hidden="true"></div></div>
+    <div class="legend"><span><i class="dot unindexed"></i>Not indexed</span><span><i class="dot"></i>No files</span><span><i class="dot partial"></i>Partial</span><span><i class="dot complete"></i>Complete</span></div>
+  </div>
+  <div class="stage">
+    <div class="stage-heading"><h2>Parsing coverage</h2><span class="caption">Height = downloaded filings</span></div>
+    <p class="summary-heading" id="summaryRange">Totals for the selected range</p>
+    <div id="aggregateProgress" class="aggregate-progress" role="img" aria-label="Loading aggregate parsing progress"></div>
+    <p class="note aggregate-note" id="aggregateDownloads">Loading downloaded and indexed totals…</p>
+    <div class="summary" aria-label="Aggregate parsing counts for the selected range">
+      <div class="metric"><div class="metric-label">Extracted</div><div id="parsedCount" class="metric-value">—</div><div id="parsedRatio" class="metric-sub">of downloaded filings</div></div>
+      <div class="metric"><div class="metric-label">Completed without issues</div><div id="cleanCount" class="metric-value">—</div><div class="metric-sub">included in extracted</div></div>
+      <div class="metric warning"><div class="metric-label">Completed with warnings</div><div id="warningCount" class="metric-value">—</div><div class="metric-sub">included in extracted</div></div>
+      <div class="metric review"><div class="metric-label">Needs review</div><div id="reviewCount" class="metric-value">—</div><div class="metric-sub">included in extracted</div></div>
+      <div class="metric"><div class="metric-label">Not yet extracted</div><div id="remainingCount" class="metric-value">—</div><div class="metric-sub">failures + in progress + waiting</div></div>
+      <div class="metric failed"><div class="metric-label">Failed / unsupported</div><div id="failedCount" class="metric-value">—</div><div class="metric-sub">included in not yet extracted</div></div>
+      <div class="metric"><div class="metric-label">In progress</div><div id="runningCount" class="metric-value">—</div><div class="metric-sub">included in not yet extracted</div></div>
+      <div class="metric"><div class="metric-label">Waiting</div><div id="pendingCount" class="metric-value">—</div><div class="metric-sub">included in not yet extracted</div></div>
+    </div>
+    <div class="scroll" id="parseScroll"><div id="parseTimeline" class="timeline loading" role="group" aria-label="Monthly parsing; arrow keys explore months, up moves to downloads"></div><div id="parseAxis" class="axis" aria-hidden="true"></div></div>
+    <div class="legend"><span><i class="dot complete"></i>Completed</span><span><i class="dot review"></i>Needs review</span><span><i class="dot"></i>Failed / unsupported</span><span><i class="dot running"></i>In progress</span><span><i class="dot pending"></i>Waiting</span></div>
+    <p class="note">Summary totals cover every month in the selected range and stay fixed when exploring the chart. Extracted = completed without issues + completed with warnings + needs review. Hover, tap or focus a month for its details. Coverage uses current source and parser versions; integrity verification is reported separately by the CLI.</p>
+  </div>
+  <div id="error" class="error" role="alert"></div>
+</section>
+<section class="freshness" aria-label="Coverage freshness">
+  <div><h2>Last indexed</h2><time id="lastIndexed">Loading…</time><p id="indexedSource"></p></div>
+  <div><h2>Last parsed</h2><time id="lastParsed">Loading…</time><p id="refreshLabel">Current extractions · checks every 30 seconds</p></div>
+  <div class="viewFreshness"><h2>Data refreshed</h2><time id="viewRefreshed">Waiting for data…</time></div>
+</section>
+</main>
 <div id="tooltip" role="tooltip" hidden></div>
 <script>
-const timeline=document.getElementById('timeline'),axis=document.getElementById('axis'),tooltip=document.getElementById('tooltip'),error=document.getElementById('error');
+const tooltip=document.getElementById('tooltip'),error=document.getElementById('error');
+const charts={download:{timeline:document.getElementById('timeline'),axis:document.getElementById('axis'),scroll:document.getElementById('downloadScroll')},parse:{timeline:document.getElementById('parseTimeline'),axis:document.getElementById('parseAxis'),scroll:document.getElementById('parseScroll')}};
 const stamp=value=>new Intl.DateTimeFormat('en-GB',{dateStyle:'medium',timeStyle:'medium',timeZone:'Europe/London'}).format(new Date(value))+' · London';
 const fmt=n=>Number(n).toLocaleString(),monthName=key=>new Date(key+'-01T12:00:00Z').toLocaleDateString('en-GB',{month:'long',year:'numeric',timeZone:'UTC'});
-let months=[],activeKey=null,buttons=[],initial=true;
-function textRow(label,value){const row=document.createElement('div');row.className='detail';const name=document.createElement('span'),count=document.createElement('span');name.textContent=label;count.textContent=value;row.append(name,count);return row;}
-function show(key,anchor){const month=months.find(item=>item.month===key);if(!month)return;activeKey=key;tooltip.replaceChildren();const title=document.createElement('div');title.className='month';title.textContent=monthName(key);tooltip.append(title,textRow('Downloaded',fmt(month.downloaded)),textRow('Indexed',fmt(month.indexed)),textRow('Expected total',month.expected===null?'Unknown':fmt(month.expected)));
-if(month.expected!==null)tooltip.append(textRow('Remaining',fmt(month.expected-month.downloaded)));
-if(month.expected===null||month.expected===0){const note=document.createElement('div');note.className='tipnote';note.textContent=month.state==='unindexed'?'No index loaded for this month. The expected total is unknown.':month.open_month?'Month still in progress. Indexed counts may grow.':month.expected===null?'Full-month index not loaded. Expected count is not yet known.':'No ownership filings in the loaded index for this month.';tooltip.append(note);}
-tooltip.hidden=false;const rect=anchor.getBoundingClientRect();tooltip.style.left=Math.max(10,Math.min(rect.left+rect.width/2-132,window.innerWidth-275))+'px';tooltip.style.top=Math.min(rect.bottom+14,window.innerHeight-tooltip.offsetHeight-10)+'px';}
-function hide(){activeKey=null;tooltip.hidden=true;}
-function render(){const peak=Math.max(1,...months.map(month=>month.indexed));const focused=document.activeElement?.dataset.month;timeline.replaceChildren();axis.replaceChildren();buttons=[];
-for(const [index,month] of months.entries()){const bar=document.createElement('button');bar.type='button';bar.className='bar '+month.state;bar.dataset.month=month.month;bar.style.height=Math.max(4,100*month.indexed/peak)+'px';bar.tabIndex=(focused?month.month===focused:index===0)?0:-1;
-if(month.state==='partial'&&month.expected>0){const percent=Math.max(0,Math.min(100,100*month.downloaded/month.expected));bar.style.background=`linear-gradient(to top,#16b77f 0%,#16b77f ${percent}%,#e15d56 ${percent}%,#e15d56 100%)`;}
-bar.setAttribute('aria-label',`${monthName(month.month)}: ${fmt(month.downloaded)} downloaded, ${fmt(month.indexed)} indexed; expected ${month.expected===null?'unknown':fmt(month.expected)}`);bar.setAttribute('aria-describedby','tooltip');
-bar.onmouseenter=()=>show(month.month,bar);bar.onmouseleave=()=>{if(document.activeElement!==bar)hide();};bar.onfocus=()=>show(month.month,bar);bar.onblur=hide;bar.onclick=()=>show(month.month,bar);
-bar.onkeydown=event=>{let target=index;if(event.key==='ArrowRight')target=Math.min(index+1,months.length-1);else if(event.key==='ArrowLeft')target=Math.max(index-1,0);else if(event.key==='Home')target=0;else if(event.key==='End')target=months.length-1;else if(event.key==='Escape'){hide();return;}else return;event.preventDefault();bar.tabIndex=-1;buttons[target].tabIndex=0;buttons[target].focus();};timeline.append(bar);buttons.push(bar);}
-for(const [index,month] of months.entries()){if(index===0||index===months.length-1||(index>12&&index<months.length-18&&month.month.endsWith('-01')&&Number(month.month.slice(0,4))%5===0)){const label=document.createElement('span');label.textContent=month.month.slice(0,4);label.style.left=100*(index/(months.length-1))+'%';axis.append(label);}}
-axis.style.width=timeline.scrollWidth+'px';timeline.classList.remove('loading');if(initial&&months.length){const scroller=document.querySelector('.scroll');scroller.scrollLeft=scroller.scrollWidth;initial=false;}if(months.length)document.getElementById('range').textContent=monthName(months[0].month)+' — '+monthName(months.at(-1).month)+' · Forms 3, 4 & 5';if(focused)buttons.find(button=>button.dataset.month===focused)?.focus();if(activeKey){const bar=buttons.find(button=>button.dataset.month===activeKey);if(bar)show(activeKey,bar);}}
-let fetching=false;async function refresh(){if(fetching)return;fetching=true;try{const response=await fetch('/api/coverage');const data=await response.json();if(!response.ok)throw Error(data.error||'Unable to load coverage');months=data.months;render();const latest=data.last_indexed;document.getElementById('lastIndexed').textContent=latest?stamp(latest.indexed_at):'Not indexed yet';document.getElementById('indexedSource').textContent=latest?`${latest.kind==='quarterly'?'Quarterly':'Daily'} index · ${latest.period}${latest.offline?' · Local import / cache replay':''}`:'';document.getElementById('viewRefreshed').textContent=stamp(new Date());error.textContent='';}catch(e){error.textContent=e.message;}finally{fetching=false;}}
-function reposition(){const focused=document.activeElement;if(focused?.dataset.month)show(focused.dataset.month,focused);else hide();}window.addEventListener('resize',reposition);document.querySelector('.scroll').addEventListener('scroll',reposition);document.addEventListener('keydown',event=>{if(event.key==='Escape')hide();});refresh();setInterval(()=>{if(!document.hidden)refresh();},10000);
+let months=[],active=null,buttons={download:[],parse:[]},initial=true,restoringFocus=false;
+function textRow(label,value){
+  const row=document.createElement('div');row.className='detail';
+  const name=document.createElement('span'),count=document.createElement('span');
+  name.textContent=label;count.textContent=value;row.append(name,count);return row;
+}
+function updateSummary(){
+  const totals={indexed:0,downloaded:0,parsing:{parsed:0,completed:0,with_warnings:0,needs_review:0,failed:0,unsupported:0,running:0,pending:0,remaining:0}};
+  for(const month of months){
+    totals.indexed+=month.indexed;totals.downloaded+=month.downloaded;
+    for(const key of Object.keys(totals.parsing))totals.parsing[key]+=month.parsing[key];
+  }
+  const p=totals.parsing,percent=totals.downloaded?(100*p.parsed/totals.downloaded).toFixed(1)+'%':null;
+  document.getElementById('summaryRange').textContent=months.length?'Range totals · '+monthName(months[0].month)+' — '+monthName(months.at(-1).month):'Totals for the selected range';
+  document.getElementById('aggregateDownloads').textContent=fmt(totals.downloaded)+' downloaded · '+fmt(totals.indexed)+' indexed across the selected months';
+  const progress=document.getElementById('aggregateProgress');progress.style.background=parsingFill(totals,'to right');
+  progress.setAttribute('aria-label',percent?percent+' extracted across the selected range; '+fmt(p.remaining)+' not yet extracted':'No downloaded filings in the selected range');
+  document.getElementById('parsedCount').textContent=fmt(p.parsed);
+  document.getElementById('parsedRatio').textContent=percent?percent+' of '+fmt(totals.downloaded)+' downloads':'No downloads in this range';
+  document.getElementById('cleanCount').textContent=fmt(p.completed-p.with_warnings);
+  document.getElementById('warningCount').textContent=fmt(p.with_warnings);
+  document.getElementById('reviewCount').textContent=fmt(p.needs_review);
+  document.getElementById('failedCount').textContent=fmt(p.failed+p.unsupported);
+  document.getElementById('remainingCount').textContent=fmt(p.remaining);
+  document.getElementById('runningCount').textContent=fmt(p.running);
+  document.getElementById('pendingCount').textContent=fmt(p.pending);
+}
+function show(stage,key,anchor){
+  const month=months.find(item=>item.month===key);if(!month)return;
+  active={stage,key};tooltip.replaceChildren();
+  const title=document.createElement('div');title.className='month';
+  title.textContent=monthName(key)+' · '+(stage==='parse'?'Parsing':'Downloads');tooltip.append(title);
+  let note='';
+  if(stage==='parse'){
+    const p=month.parsing;
+    for(const [label,value] of [['Downloaded',month.downloaded],['Extracted',p.parsed],['Completed with warnings',p.with_warnings],['Needs review',p.needs_review],['Failed',p.failed],['Unsupported',p.unsupported],['In progress',p.running],['Waiting',p.pending]])tooltip.append(textRow(label,fmt(value)));
+    note=month.downloaded?'Review cases are included in extracted. Coverage uses current source and extraction versions; it does not certify integrity.':'No downloaded filings to parse for this month.';
+  }else{
+    tooltip.append(textRow('Downloaded',fmt(month.downloaded)),textRow('Indexed',fmt(month.indexed)),textRow('Expected total',month.expected===null?'Unknown':fmt(month.expected)));
+    if(month.expected!==null)tooltip.append(textRow('Remaining',fmt(month.expected-month.downloaded)));
+    if(month.expected===null||month.expected===0)note=month.state==='unindexed'?'No index loaded for this month. The expected total is unknown.':month.open_month?'Month still in progress. Indexed counts may grow.':month.expected===null?'Full-month index not loaded. Expected count is not yet known.':'No ownership filings in the loaded index for this month.';
+  }
+  if(note){const detail=document.createElement('div');detail.className='tipnote';detail.textContent=note;tooltip.append(detail);}
+  tooltip.hidden=false;const rect=anchor.getBoundingClientRect();
+  tooltip.style.left=Math.max(10,Math.min(rect.left+rect.width/2-145,window.innerWidth-300))+'px';
+  tooltip.style.top=Math.max(10,Math.min(rect.bottom+14,window.innerHeight-tooltip.offsetHeight-10))+'px';
+}
+function hide(){active=null;tooltip.hidden=true;}
+function parsingFill(month,direction='to top'){
+  if(!month.downloaded)return '#dce2dd';
+  const p=month.parsing,segments=[[p.completed,'#16b77f'],[p.needs_review,'#e9ad43'],[p.failed+p.unsupported,'#e15d56'],[p.running,'#6485c4'],[p.pending,'#dce2dd']];
+  let at=0;const stops=[];
+  for(const [count,color] of segments){if(!count)continue;const end=Math.min(100,at+100*count/month.downloaded);stops.push(color+' '+at+'%',color+' '+end+'%');at=end;}
+  return stops.length?'linear-gradient('+direction+','+stops.join(',')+')':'#dce2dd';
+}
+function render(){
+  const prior=active;
+  const focused=document.activeElement?.dataset,focus=focused?.month?{key:focused.month,stage:focused.stage}:null;
+  const savedScroll=charts.download.scroll.scrollLeft;buttons={download:[],parse:[]};
+  for(const [stage,chart] of Object.entries(charts)){
+    const peak=Math.max(1,...months.map(month=>stage==='parse'?month.downloaded:month.indexed));
+    chart.timeline.replaceChildren();chart.axis.replaceChildren();
+    chart.axis.classList.toggle('month-axis',months.length<=24);
+    for(const [index,month] of months.entries()){
+      const bar=document.createElement('button');bar.type='button';
+      bar.className=stage==='parse'?'bar parsing '+month.parsing.state:'bar '+month.state;
+      bar.dataset.month=month.month;bar.dataset.stage=stage;
+      bar.style.height=Math.max(4,100*(stage==='parse'?month.downloaded:month.indexed)/peak)+'px';
+      bar.tabIndex=(focus?.stage===stage?month.month===focus.key:index===months.length-1)?0:-1;
+      if(stage==='parse')bar.style.background=parsingFill(month);
+      else if(month.state==='partial'&&month.expected>0){
+        const percent=Math.max(0,Math.min(100,100*month.downloaded/month.expected));
+        bar.style.background='linear-gradient(to top,#16b77f 0%,#16b77f '+percent+'%,#e15d56 '+percent+'%,#e15d56 100%)';
+      }
+      const p=month.parsing;
+      const description=stage==='parse'?fmt(p.parsed)+' extracted of '+fmt(month.downloaded)+' downloads; '+fmt(p.needs_review)+' need review; '+fmt(p.failed+p.unsupported)+' failed or unsupported; '+fmt(p.running)+' in progress; '+fmt(p.pending)+' waiting':fmt(month.downloaded)+' downloaded, '+fmt(month.indexed)+' indexed; expected '+(month.expected===null?'unknown':fmt(month.expected));
+      bar.setAttribute('aria-label',monthName(month.month)+': '+description);bar.setAttribute('aria-describedby','tooltip');
+      bar.onmouseenter=()=>show(stage,month.month,bar);
+      bar.onmouseleave=()=>{if(document.activeElement!==bar)hide();};
+      bar.onfocus=()=>{if(!restoringFocus)show(stage,month.month,bar);};bar.onblur=hide;bar.onclick=()=>show(stage,month.month,bar);
+      bar.onkeydown=event=>{
+        let target=index,targetStage=stage;
+        if(event.key==='ArrowRight')target=Math.min(index+1,months.length-1);
+        else if(event.key==='ArrowLeft')target=Math.max(index-1,0);
+        else if(event.key==='Home')target=0;else if(event.key==='End')target=months.length-1;
+        else if(event.key==='ArrowDown')targetStage='parse';else if(event.key==='ArrowUp')targetStage='download';
+        else if(event.key==='Escape'){hide();return;}else return;
+        event.preventDefault();for(const button of buttons[targetStage])button.tabIndex=-1;
+        buttons[targetStage][target].tabIndex=0;buttons[targetStage][target].focus();
+      };
+      chart.timeline.append(bar);buttons[stage].push(bar);
+    }
+    for(const [index,month] of months.entries()){
+      if(months.length<=24||index===0||index===months.length-1||(index>12&&index<months.length-18&&month.month.endsWith('-01')&&Number(month.month.slice(0,4))%5===0)){
+        const label=document.createElement('span');
+        label.textContent=months.length<=24?new Date(month.month+'-01T12:00:00Z').toLocaleDateString('en-GB',{month:'short',...(month.month.endsWith('-01')?{year:'2-digit'}:{}),timeZone:'UTC'}):month.month.slice(0,4);
+        label.style.left=100*(months.length<=24?(index+.5)/months.length:index/Math.max(1,months.length-1))+'%';chart.axis.append(label);
+      }
+    }
+    chart.axis.style.width=chart.timeline.scrollWidth+'px';chart.timeline.classList.remove('loading');
+  }
+  for(const chart of Object.values(charts))chart.scroll.scrollLeft=initial?chart.scroll.scrollWidth:savedScroll;
+  initial=false;
+  if(months.length){
+    document.getElementById('range').textContent=monthName(months[0].month)+' — '+monthName(months.at(-1).month)+' · Forms 3, 4 & 5';
+  }
+  updateSummary();
+  restoringFocus=true;
+  if(focus)buttons[focus.stage].find(button=>button.dataset.month===focus.key)?.focus({preventScroll:true});
+  restoringFocus=false;
+  if(prior){const bar=buttons[prior.stage].find(button=>button.dataset.month===prior.key);if(bar)show(prior.stage,prior.key,bar);}else hide();
+}
+const periodSelect=document.getElementById('periodSelect'),loadState=document.getElementById('loadState');
+const currentYear=new Intl.DateTimeFormat('en',{year:'numeric',timeZone:'America/New_York'}).format(new Date());
+const refreshInterval=()=>periodSelect.value==='all'?60000:30000;
+let fetching=false,lastFetch=0,displayedPeriod=null,queuedRefresh=false;
+async function refresh(){
+  if(fetching){queuedRefresh=true;return;}
+  fetching=true;lastFetch=Date.now();const period=periodSelect.value,changingRange=displayedPeriod!==period;
+  periodSelect.disabled=changingRange;loadState.textContent=changingRange?'Loading coverage…':'';
+  try{
+    const start=period==='all'?'2003-07-01':period==='2016'?'2016-01-01':currentYear+'-01-01';
+    const response=await fetch('/api/coverage?start='+start);const data=await response.json();
+    if(!response.ok)throw Error(data.error||'Unable to load coverage');
+    if(periodSelect.value!==period){queuedRefresh=true;return;}
+    if(data.months.some(month=>!month.parsing))throw Error('Restart insider dashboard to load parsing coverage.');
+    months=data.months;render();const latest=data.last_indexed;
+    document.getElementById('lastIndexed').textContent=latest?stamp(latest.indexed_at):'Not indexed yet';
+    document.getElementById('indexedSource').textContent=latest?(latest.kind==='quarterly'?'Quarterly':'Daily')+' index · '+latest.period+(latest.offline?' · Local import / cache replay':''):'';
+    document.getElementById('lastParsed').textContent=data.last_parsed?stamp(data.last_parsed):'Not parsed yet';
+    document.getElementById('viewRefreshed').textContent=stamp(data.as_of||new Date());
+    document.getElementById('refreshLabel').textContent='Current extractions · checks every '+(refreshInterval()/1000)+' seconds';
+    displayedPeriod=period;error.textContent='';
+  }catch(e){error.textContent=e.message;}finally{fetching=false;periodSelect.disabled=false;loadState.textContent='';if(queuedRefresh){queuedRefresh=false;refresh();}}
+}
+let syncing=false;
+for(const [stage,chart] of Object.entries(charts))chart.scroll.addEventListener('scroll',()=>{
+  if(!syncing){syncing=true;charts[stage==='parse'?'download':'parse'].scroll.scrollLeft=chart.scroll.scrollLeft;syncing=false;}
+  reposition();
+});
+function reposition(){if(!active)return;const focused=document.activeElement;if(focused?.dataset.month)show(focused.dataset.stage,focused.dataset.month,focused);else hide();}
+window.addEventListener('resize',reposition);
+document.addEventListener('keydown',event=>{if(event.key==='Escape')hide();});
+periodSelect.onchange=()=>{initial=true;hide();if(fetching){periodSelect.disabled=true;loadState.textContent='Loading selected range…';}refresh();};
+refresh();setInterval(()=>{if(!document.hidden&&!fetching&&Date.now()-lastFetch>=refreshInterval())refresh();},1000);
 </script>
 </body></html>
