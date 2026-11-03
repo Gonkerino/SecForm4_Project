@@ -853,7 +853,7 @@ class OwnershipDatabaseTests(unittest.TestCase):
             Catalog.initialize(self.cfg)
             Catalog.initialize(self.cfg)
             with Catalog(self.cfg) as cat:
-                self.assertEqual(cat.status()["schema_version"], 4)
+                self.assertEqual(cat.status()["schema_version"], 5)
                 self.assertEqual(cat.status()["unique_filings_ever_observed"], 1)
 
 

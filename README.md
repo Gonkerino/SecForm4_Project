@@ -9,10 +9,12 @@ The application uses PostgreSQL exclusively. There is no SQLite fallback or auto
 ## Daily workflow
 
 ```powershell
+insider activate
 insider discover --source quarterly --start 2003-07-01 --end 2026-10-23
 insider download
 insider parse
 insider status
+insider deactivate
 ```
 
 For integrity and recovery: **`insider check` -> `insider issues` -> `insider repair --dry-run` -> `insider repair`**.
@@ -20,7 +22,7 @@ Use `insider show ACCESSION` to inspect a filing, and `insider dashboard` for do
 Add `--json` for machine output. Preview acquisition/parsing with `--dry-run`.
 Discovery and downloading remain separate explicit steps.
 
-Run **`insider admin init`** once after updating to upgrade to schema 4; it preserves existing data and refuses to overlap an active writer.
+Run **`insider admin init`** once after updating to upgrade to schema 5; it preserves existing data and refuses to overlap an active writer.
 The [CLI guide](docs/cli.md) documents all commands, filters, retry rules, persistent checks and repair guarantees.
 Old command names below remain compatible, including their JSON output; they are hidden from main help.
 The new `download` command defaults to all indexed dates, while the legacy `download-submissions` command retains its 2003-07-01 cutoff.
@@ -35,7 +37,9 @@ PostgreSQL **18.6** is installed and configured for this account. The working ca
 - Working database: `insider_research`, login `insider`.
 - Separate test database: `insider_research_test`, login `insider_test`. That login cannot connect to the working database.
 - Passwords: `%APPDATA%/postgresql/pgpass.conf`, outside the repository, in a directory restricted to this account and SYSTEM.
-- Automatic startup: `Insider Research PostgreSQL.lnk` in this account's Windows Startup folder. The server starts in the background at login; it runs as this user.
+- Manual startup: use `insider activate` when needed and `insider deactivate` afterwards.
+  `insider admin disable-autostart` moves the PostgreSQL login shortcut into
+  `data/reports/startup-backup/` for recovery; other startup items are unaffected.
 
 This account's user PATH includes `D:/Projects/SecForm4/.venv/Scripts`, so `insider` is available without activating the environment. Existing terminals may need their PATH refreshed, or the terminal application restarted. To refresh the current PowerShell session:
 
@@ -55,13 +59,24 @@ insider validate
 If needed, manage the server:
 
 ```powershell
-.venv/Scripts/python.exe scripts/postgres.py status
-.venv/Scripts/python.exe scripts/postgres.py start
-.venv/Scripts/python.exe scripts/postgres.py restart
-.venv/Scripts/python.exe scripts/postgres.py stop
+insider database-status
+insider activate
+insider deactivate
 ```
 
-`start` is safe to repeat. Stop/restart disconnect active database sessions. Server messages are in `D:/Projects/SecForm4/data/postgres/server.log`. The helper reads the installation paths from `%LOCALAPPDATA%/Programs/PostgreSQL/18/insider-research-install.json`; it does not contain passwords.
+`activate` is safe to repeat. `deactivate` refuses connected clients; close the
+dashboard and other clients first. Use `deactivate --force` only when you intend
+to disconnect them. The older `scripts/postgres.py` remains available for restart
+and reload. Server messages are in `D:/Projects/SecForm4/data/postgres/server.log`.
+Lifecycle commands read `%LOCALAPPDATA%/Programs/PostgreSQL/18/insider-research-install.json`.
+Starting the server does not start downloading, parsing, or a dashboard.
+
+Research storage retains typed ownership facts, acceptance timestamps, headers,
+document inventories, footnotes and links, issues, parser history, and raw sources.
+It omits the XML-node and individual header-line projections from PostgreSQL.
+Parsing, inspection, and source-replay validation use the database's stored
+profile automatically. Full evidence retention described later applies only to
+catalogues using the `full` profile.
 
 The local cluster is tuned for this 32 GB machine: `shared_buffers=2GB`,
 `effective_cache_size=12GB` (a planner estimate), and `max_wal_size=4GB`.
@@ -84,7 +99,7 @@ For an administrator SQL session using the saved password:
 
 ## 1. Install Python dependencies
 
-Python 3.12+ and PostgreSQL 16+ are required. The migration was tested against PostgreSQL 18.6. This checkout already has a Python environment; update it from PowerShell:
+Python 3.12+ and PostgreSQL 16+ are required. The application is tested against PostgreSQL 18.6. This checkout already has a Python environment; update it from PowerShell:
 
 ```powershell
 Set-Location D:/Projects/SecForm4
@@ -193,7 +208,7 @@ The server binds only to loopback, checks request hosts, serves bundled assets, 
 
 ## Upgrading an existing catalogue
 
-The current catalogue schema is **version 3**. After updating the Python package, run `insider --config config/default.toml init` again after any running writer finishes. It applies migrations in order: `002_submissions.sql` adds submission tracking, and `003_ownership.sql` adds extraction tables. Existing index records and downloads are preserved. Other commands require version 3 and do not migrate automatically. Unknown schema versions are rejected. Back up the database and artifacts before an upgrade.
+The current catalogue schema is **version 5**. Use `insider admin init` to initialize or update the catalogue after any running writer finishes. Existing records and downloads are preserved. Other commands require the current schema and do not upgrade it automatically. Unknown schema versions are rejected.
 
 ## Configuration and identity
 

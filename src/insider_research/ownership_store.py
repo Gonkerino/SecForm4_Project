@@ -33,6 +33,13 @@ TABLES = {
     "field_notes": "ownership_field_notes", "signatures": "ownership_signatures",
     "issues": "parse_issues",
 }
+OMITTED_RESEARCH = frozenset(('fields', 'header_fields'))
+
+
+def stored_tables(catalog):
+    return {name: table for name, table in TABLES.items()
+            if catalog.storage_profile != 'research' or name not in OMITTED_RESEARCH}
+
 JSON_COLUMNS = {"attributes", "counts_json"}
 PARSE_BATCH_SIZE = 64
 PARSE_BATCH_BYTES = 8 * 1024 * 1024
@@ -177,8 +184,9 @@ def _insert(connection, table, rows):
                     writer.write_row(values_row)
 
 
-def _counts(extracted):
-    return {name: len(getattr(extracted, name)) for name in TABLES}
+def _counts(extracted, catalog):
+    retained = stored_tables(catalog)
+    return {name: len(getattr(extracted, name)) if name in retained else 0 for name in TABLES}
 
 
 def publish(catalog, row, attempt_id, extracted, snapshot_path, source_hash):
@@ -190,11 +198,11 @@ def publish(catalog, row, attempt_id, extracted, snapshot_path, source_hash):
              parser_version,parsed_at,status,counts_json)
             VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (row["accession"], attempt_id, row["sha256"], source_hash, snapshot_path,
-             PARSER_VERSION, utc_now(), extracted.status, Jsonb(_counts(extracted)))).fetchone()["id"]
+             PARSER_VERSION, utc_now(), extracted.status, Jsonb(_counts(extracted, catalog)))).fetchone()["id"]
         _insert(connection, "submission_headers", [dict(result_id=result_id, **extracted.header)])
         _insert(connection, "submission_documents", [dict(result_id=result_id, **r) for r in extracted.documents])
         _insert(connection, "ownership_reports", [dict(result_id=result_id, **extracted.report)])
-        for name, table in TABLES.items():
+        for name, table in stored_tables(catalog).items():
             if name == "documents":
                 continue
             rows = [dict(result_id=result_id, **r) for r in getattr(extracted, name)]
@@ -262,7 +270,7 @@ def _publish_batch(catalog, prepared):
             metadata = [dict(accession=p['row']['accession'], attempt_id=p['attempt_id'],
                 source_sha256=p['row']['sha256'], source_text_sha256=p['source_hash'],
                 source_snapshot_path=p['snapshot_path'], status=p['status'],
-                counts_json=_counts(p['extracted']),
+                counts_json=_counts(p['extracted'], catalog),
                 supersedes_result_id=p['row'].get('previous_result_id')) for p in successful]
             result_ids = {r['accession']: r['id'] for r in connection.execute('''INSERT INTO parse_results
                 (accession,attempt_id,source_sha256,source_text_sha256,source_snapshot_path,
@@ -273,13 +281,13 @@ def _publish_batch(catalog, prepared):
                     source_sha256 text,source_text_sha256 text,source_snapshot_path text,
                     status text,counts_json jsonb,supersedes_result_id bigint) RETURNING accession,id''', (PARSER_VERSION, Jsonb(metadata)))}
             tables = {'submission_headers': [], 'submission_documents': [], 'ownership_reports': [],
-                      **{table: [] for table in TABLES.values()}}
+                      **{table: [] for table in stored_tables(catalog).values()}}
             for p in successful:
                 result_id = result_ids[p['row']['accession']]
                 extracted = p['extracted']
                 tables['submission_headers'].append(_ResultGroup(result_id, [extracted.header]))
                 tables['ownership_reports'].append(_ResultGroup(result_id, [extracted.report]))
-                for name, table in TABLES.items():
+                for name, table in stored_tables(catalog).items():
                     rows = getattr(extracted, name)
                     if name == 'issues':
                         rows = [dict(issue_number=number, **row) for number, row in enumerate(rows, 1)]
@@ -575,6 +583,7 @@ def parsing_status(cfg):
 def inspect_ownership(cfg, accession, *, result_id=None):
     with Catalog(cfg) as catalog, catalog.connection.transaction():
         catalog.connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        catalog.storage_profile = catalog.connection.execute("SELECT value FROM metadata WHERE key='storage_profile'").fetchone()['value']
         if result_id is None:
             selected = catalog.connection.execute("SELECT result_id FROM ownership_current_results WHERE accession=%s", (accession,)).fetchone()
             result_id = selected["result_id"] if selected else None
@@ -582,8 +591,9 @@ def inspect_ownership(cfg, accession, *, result_id=None):
         attempts = list(catalog.connection.execute("SELECT * FROM parse_attempts WHERE accession=%s ORDER BY id", (accession,)))
         if result is None:
             return dict(accession=accession, result=None, attempts=attempts)
-        output = dict(result=result, attempts=attempts)
-        for name, table in {"header": "submission_headers", "report": "ownership_reports", **TABLES}.items():
+        output = dict(result=result, attempts=attempts, storage_profile=catalog.storage_profile,
+                      omitted_evidence=sorted(OMITTED_RESEARCH) if catalog.storage_profile == 'research' else [])
+        for name, table in {"header": "submission_headers", "report": "ownership_reports", **stored_tables(catalog)}.items():
             order = "source_path" if name in ("fields", "field_notes") else "line_number" if name == "header_fields" else "document_number" if name == "documents" else "issue_number" if name == "issues" else "row_number" if name not in ("header", "report") else "result_id"
             output[name] = list(catalog.connection.execute(sql.SQL("SELECT * FROM {} WHERE result_id=%s ORDER BY {}").format(sql.Identifier(table), sql.Identifier(order)), (result_id,)))
         return output
@@ -600,7 +610,7 @@ def validate_result(cfg, catalog, row):
         extracted = parse_submission(body, row["accession"], parser_version=row['parser_version'])
         if set(row["counts_json"]) != set(TABLES):
             messages.append("Result manifest does not account for every extraction table")
-        for name, table in {"header": "submission_headers", "report": "ownership_reports", **TABLES}.items():
+        for name, table in {"header": "submission_headers", "report": "ownership_reports", **stored_tables(catalog)}.items():
             expected = [extracted.header] if name == "header" else [extracted.report] if name == "report" else getattr(extracted, name)
             actual = [{k: v for k, v in r.items() if k != "result_id"} for r in catalog.connection.execute(
                 sql.SQL("SELECT * FROM {} WHERE result_id=%s").format(sql.Identifier(table)), (row["id"],))]
@@ -633,6 +643,7 @@ def validate_ownership(cfg, *, progress=None, on_result=None, **filters):
     problems, checked, problem_count = [], 0, 0
     with Catalog(cfg) as catalog, catalog.connection.transaction():
         catalog.connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        catalog.storage_profile = catalog.connection.execute("SELECT value FROM metadata WHERE key='storage_profile'").fetchone()['value']
         where, params = _selection(**filters)
         where = where.replace("s.accession", "r.accession")
         total = catalog.connection.execute(f"SELECT count(*) AS n FROM parse_results r WHERE {where}", params).fetchone()["n"]
@@ -657,4 +668,5 @@ def validate_ownership(cfg, *, progress=None, on_result=None, **filters):
                     progress(dict(event="progress", current=checked, problems=problem_count))
     return dict(status="valid" if problem_count == 0 else "invalid", results_checked=checked,
                 problem_count=problem_count, problems=problems,
+                storage_profile=catalog.storage_profile,
                 note="Checks extraction fidelity, not source truth or full SEC coverage. Use parsing-status for unresolved cases.")

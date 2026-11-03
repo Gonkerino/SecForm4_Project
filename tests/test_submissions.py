@@ -61,7 +61,7 @@ class SubmissionTests(unittest.TestCase):
         try:
             Catalog.initialize(legacy)
             with Catalog(legacy) as catalog:
-                self.assertEqual(catalog.status()["schema_version"], 4)
+                self.assertEqual(catalog.status()["schema_version"], 5)
                 self.assertEqual(catalog.status()["unique_filings_ever_observed"], 1)
                 self.assertEqual(catalog.status()["submissions_downloaded"], 0)
         finally:

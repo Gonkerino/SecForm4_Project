@@ -51,6 +51,10 @@ def publisher_lock(root: Path, catalog, *, lane=None):
                 ).fetchone()["acquired"]
                 if not lane_locked:
                     raise ValueError(f"Another {lane} writer is active in PostgreSQL; retry after it finishes")
+            # Read the committed profile after the gate: the catalogue may have
+            # been opened just before an exclusive compact migration.
+            catalog.storage_profile = catalog.connection.execute(
+                "SELECT value FROM metadata WHERE key='storage_profile'").fetchone()['value']
             yield
         finally:
             try:

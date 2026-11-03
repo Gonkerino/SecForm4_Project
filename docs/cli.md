@@ -5,6 +5,7 @@ commands never launch the next stage automatically. Forms 3, 4, 5 and their
 amendments are included unless `--form` narrows the selection.
 
 ```powershell
+insider activate
 insider admin init
 insider discover --source quarterly --start 2003-07-01 --end 2026-10-23
 insider download --dry-run
@@ -12,9 +13,10 @@ insider download
 insider parse --dry-run
 insider parse
 insider status
+insider deactivate
 ```
 
-`admin init` upgrades existing schemas transactionally to version 4 without
+`admin init` upgrades existing schemas transactionally to version 5 without
 discarding data. It refuses to run while another publisher owns the database
 lock. Finish or interrupt that operation normally before upgrading. Restart
 long-lived dashboard processes after upgrading the installed code/schema.
@@ -23,6 +25,9 @@ long-lived dashboard processes after upgrading the installed code/schema.
 
 | Command | Purpose |
 | --- | --- |
+| `activate` | Start the local PostgreSQL cluster explicitly; repeat safely |
+| `deactivate` | Stop the cluster; refuses clients unless `--force` is supplied |
+| `database-status` | Report local server state without connecting to the catalogue |
 | `discover` | Fetch SEC indexes and register filing identities |
 | `download` | Fetch pending full submissions into verified ZIPs |
 | `parse` | Extract local ownership documents into relational tables |
@@ -34,9 +39,17 @@ long-lived dashboard processes after upgrading the installed code/schema.
 | `dashboard` | Display monthly download and parsing coverage |
 | `admin` | Rare setup, imports, listings, coverage detail and recovery |
 
+`insider admin disable-autostart` moves only the PostgreSQL Windows login
+shortcut to `data/reports/startup-backup/`. Restore that shortcut to the user's
+Windows Startup folder to re-enable login startup.
+
+`parse`, `check`, `repair` and `show` use the database's stored profile
+automatically. Research storage retains typed facts, raw headers, footnotes and
+links while omitting the XML-node and individual header-line projections.
+
 Main commands print readable text by default. Add `--json` for machine-readable
 output. Progress goes to stderr, leaving stdout suitable for JSON pipelines.
-`show --details` exposes all extracted tables and preserved XML/header evidence;
+`show --details` exposes retained extraction tables and identifies omitted evidence;
 `show --json` always includes that complete representation. `--result-id` selects
 a retained extraction revision. The dashboard shows acquisition and current
 extraction coverage; integrity verification remains a separate CLI operation.

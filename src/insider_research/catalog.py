@@ -15,7 +15,7 @@ from psycopg.types.json import Jsonb
 
 from .config import Config
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utc_now() -> str:
@@ -36,7 +36,7 @@ def connect(cfg: Config):
             connection.close()
         # Connection diagnostics may contain a supplied URI/password.
         raise ValueError("Cannot connect to PostgreSQL. Check the server, database, role and password "
-                         "settings (INSIDER_DATABASE_URL); see README.md for setup.") from None
+                         "settings (INSIDER_DATABASE_URL); run 'insider activate' for the local server.") from None
 
 
 def lock_key(cfg: Config) -> int:
@@ -76,6 +76,9 @@ class Catalog:
             raise ValueError(f"Unsupported catalogue schema {metadata.get('schema_version')}; expected {SCHEMA_VERSION}; run insider admin init")
         if metadata.get("data_root") != str(self.cfg.data_root):
             raise ValueError("PostgreSQL catalogue belongs to a different data_root; use its configured directory")
+        self.storage_profile = metadata.get('storage_profile', 'full')
+        if self.storage_profile not in ('full', 'research'):
+            raise ValueError('Unknown database storage profile')
 
     def __enter__(self):
         return self
@@ -109,9 +112,9 @@ class Catalog:
                 connection.execute("INSERT INTO metadata(key,value) VALUES ('data_root',%s)", (str(cfg.data_root),))
             metadata = {r["key"]: r["value"] for r in connection.execute("SELECT * FROM metadata")}
             version = metadata.get("schema_version")
-            if version not in ("1", "2", "3", str(SCHEMA_VERSION)):
+            if version not in ("1", "2", "3", "4", str(SCHEMA_VERSION)):
                 raise ValueError(f"Unsupported catalogue schema {version}")
-            for target, filename in ((2, "002_submissions.sql"), (3, "003_ownership.sql"), (4, "004_health.sql")):
+            for target, filename in ((2, "002_submissions.sql"), (3, "003_ownership.sql"), (4, "004_health.sql"), (5, "005_storage.sql")):
                 if int(version) < target:
                     migration = files("insider_research").joinpath("migrations/" + filename).read_text(encoding="utf-8-sig")
                     connection.execute(migration)
@@ -200,7 +203,7 @@ class Catalog:
             (SELECT count(*) FROM attempts a WHERE a.id=(SELECT max(id) FROM attempts b
                 WHERE b.source_id=a.source_id) AND a.status!='validated') AS failed_latest_attempts,
             (SELECT count(*) FROM runs WHERE status='running') AS running_runs""").fetchone()
-        return {"database_backend": "postgresql", "schema_version": SCHEMA_VERSION, **result,
+        return {"database_backend": "postgresql", "schema_version": SCHEMA_VERSION, "storage_profile": self.storage_profile, **result,
                 "note": "Use parsing-status for ownership extraction. Market prices, features and signals are not implemented."}
 
     def coverage(self) -> list[dict]:

@@ -24,6 +24,9 @@ from .sources.indexes import ACCESSION, plan_sources
 from .submissions import download_submissions
 
 PUBLIC = {
+    'activate': 'Start the local PostgreSQL database explicitly',
+    'deactivate': 'Stop the local PostgreSQL database',
+    'database-status': 'See whether the local PostgreSQL server is running',
     'discover': 'Catalogue filings from SEC indexes',
     'download': 'Download pending full submissions',
     'parse': 'Extract downloaded Forms 3/4/5 and amendments',
@@ -106,9 +109,16 @@ def parser():
             cmd.add_argument('--no-browser', action='store_true')
         elif name == 'admin':
             admin = cmd.add_subparsers(dest='admin_command', required=True)
+            storage = admin.add_parser('compact', help='Plan or apply research storage migration')
+            storage.add_argument('--apply', action='store_true')
+            storage.add_argument('--backup-dir', type=Path)
+            storage.add_argument('--json', action='store_true')
+            admin.add_parser('disable-autostart', help='Move the database Startup shortcut to a recoverable backup')
             old_sub = next(a for a in legacy_cli.parser()._actions if isinstance(a, argparse._SubParsersAction))
             for action, old in ADMIN.items():
                 admin.add_parser(action, parents=[old_sub.choices[old]], add_help=False)
+        elif name == 'deactivate':
+            cmd.add_argument('--force', action='store_true', help='Disconnect existing database clients')
     old_sub = next(a for a in legacy_cli.parser()._actions if isinstance(a, argparse._SubParsersAction))
     for name, old in old_sub.choices.items():
         if name not in PUBLIC:
@@ -193,7 +203,16 @@ def main(argv=None):
         if limit is not None and not 1 <= limit <= 10000:
             raise ValueError('Limit must be between 1 and 10000')
         filters = dict(start=start, end=end, form=getattr(args, 'form', None), accession=accession)
-        if args.command == 'status':
+        if args.command in ('activate', 'deactivate', 'database-status'):
+            from .database_control import control
+            result = control(cfg, {'activate':'start', 'deactivate':'stop', 'database-status':'status'}[args.command], force=getattr(args, 'force', False))
+        elif args.command == 'admin' and args.admin_command == 'disable-autostart':
+            from .database_control import disable_autostart
+            result = disable_autostart(cfg)
+        elif args.command == 'admin' and args.admin_command == 'compact':
+            from .storage import compact
+            result = compact(cfg, apply=args.apply, backup_dir=args.backup_dir)
+        elif args.command == 'status':
             result = health.status(cfg)
         elif args.command == 'show':
             result = health.show(cfg, accession, result_id=args.result_id)
